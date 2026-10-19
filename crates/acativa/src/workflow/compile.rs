@@ -155,7 +155,44 @@ fn compile_workflow(
 // build the values at all — not on purpose either.
 // ---------------------------------------------------------------------------
 
-/// The compiler semantics line this crate owns: how a definition is lowered.
+/// The persisted identity lines a host binds to plan identity.
+///
+/// The lines are the host's persisted/wire vocabulary, exactly like
+/// [`crate::SchemaId`]: a version value names "a version of this line", and the
+/// line itself decides which recorded strings a host accepts as its own. A
+/// host that binds `licoup.workflow.compiler` cannot read, and must not be
+/// read by, a record that declares `acativa.workflow.compiler` — the wire
+/// forms differ on purpose.
+///
+/// All three fields are `'static`: persisted identity is a property a build
+/// carries, not a value it loads.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct PlanIdentity {
+    /// The compiler-semantics line, e.g. `"acativa.workflow.compiler"`.
+    pub compiler_semantics: &'static str,
+    /// The engine-semantics line, e.g. `"acativa.workflow.engine"`.
+    pub engine_semantics: &'static str,
+    /// The binding-identity encoding prefix, e.g.
+    /// `"acativa.workflow.plan-key.v1"`. It enters every binding digest, so two
+    /// identities produce different digests for the same plan.
+    pub plan_key_schema: &'static str,
+}
+
+impl PlanIdentity {
+    pub const fn new(
+        compiler_semantics: &'static str,
+        engine_semantics: &'static str,
+        plan_key_schema: &'static str,
+    ) -> Self {
+        Self {
+            compiler_semantics,
+            engine_semantics,
+            plan_key_schema,
+        }
+    }
+}
+
+/// The compiler semantics line this crate lowers under in its own fixtures.
 const COMPILER_SEMANTICS_LINE: &str = "acativa.workflow.compiler";
 /// The version of [`COMPILER_SEMANTICS_LINE`] this build lowers under.
 ///
@@ -181,6 +218,15 @@ const ENGINE_SEMANTICS_VERSION: u16 = 1;
 /// Prefix of the binding-identity encoding. Changing it changes every identity,
 /// so it carries the version of the identity scheme itself.
 const BINDING_IDENTITY_SCHEMA: &str = "acativa.workflow.plan-key.v1";
+
+/// The identity lines Acativa's own fixtures and conformance suite bind. A
+/// product host binds its own lines at the same parameter so its persisted
+/// plan records keep their existing spellings.
+pub const ACATIVA_PLAN_IDENTITY: PlanIdentity = PlanIdentity::new(
+    COMPILER_SEMANTICS_LINE,
+    ENGINE_SEMANTICS_LINE,
+    BINDING_IDENTITY_SCHEMA,
+);
 /// Longest recorded value echoed back in a diagnostic.
 const MAX_ECHOED_VALUE: usize = 64;
 /// Longest accepted capability tag, e.g. `vendor.example/render`.
@@ -200,26 +246,58 @@ impl CompilerSemantics {
     /// The semantics this build lowers under.
     pub const CURRENT: Self = Self(COMPILER_SEMANTICS_VERSION);
 
-    /// Name a version of this crate's compiler semantics line.
+    /// Name a version of the compiler semantics line `identity` binds.
     ///
     /// A version newer than this build is refused: only lowering behavior that
     /// exists can be named. An earlier version is nameable, because a run may
     /// still be bound to it, even though this build is not its interpreter.
-    pub fn version(version: u16) -> std::result::Result<Self, PlanInputError> {
-        semantics_version(COMPILER_SEMANTICS_LINE, COMPILER_SEMANTICS_VERSION, version).map(Self)
+    pub fn version(
+        identity: &PlanIdentity,
+        version: u16,
+    ) -> std::result::Result<Self, PlanInputError> {
+        semantics_version(
+            identity.compiler_semantics,
+            COMPILER_SEMANTICS_VERSION,
+            version,
+        )
+        .map(Self)
+    }
+
+    /// `version` under Acativa's own identity lines — the generic dialect.
+    pub fn generic_version(version: u16) -> std::result::Result<Self, PlanInputError> {
+        Self::version(&ACATIVA_PLAN_IDENTITY, version)
     }
 
     pub const fn version_of(self) -> u16 {
         self.0
     }
 
-    /// The recorded form: `acativa.workflow.compiler.v1`.
-    pub fn wire(self) -> String {
-        semantics_wire(COMPILER_SEMANTICS_LINE, self.0)
+    /// The recorded form under `identity`'s lines:
+    /// `acativa.workflow.compiler.v1` for [`ACATIVA_PLAN_IDENTITY`].
+    pub fn wire(self, identity: &PlanIdentity) -> String {
+        semantics_wire(identity.compiler_semantics, self.0)
     }
 
-    pub fn from_wire(value: &str) -> std::result::Result<Self, PlanInputError> {
-        parse_semantics_wire(COMPILER_SEMANTICS_LINE, COMPILER_SEMANTICS_VERSION, value).map(Self)
+    /// The recorded form under Acativa's own identity lines.
+    pub fn generic_wire(self) -> String {
+        self.wire(&ACATIVA_PLAN_IDENTITY)
+    }
+
+    pub fn from_wire(
+        identity: &PlanIdentity,
+        value: &str,
+    ) -> std::result::Result<Self, PlanInputError> {
+        parse_semantics_wire(
+            identity.compiler_semantics,
+            COMPILER_SEMANTICS_VERSION,
+            value,
+        )
+        .map(Self)
+    }
+
+    /// `from_wire` under Acativa's own identity lines.
+    pub fn generic_from_wire(value: &str) -> std::result::Result<Self, PlanInputError> {
+        Self::from_wire(&ACATIVA_PLAN_IDENTITY, value)
     }
 }
 
@@ -232,8 +310,10 @@ impl From<CompilerSemantics> for u16 {
 impl TryFrom<u16> for CompilerSemantics {
     type Error = PlanInputError;
 
+    /// Names a version of Acativa's own compiler line. A host binding other
+    /// lines calls [`CompilerSemantics::version`] with its `PlanIdentity`.
     fn try_from(version: u16) -> std::result::Result<Self, Self::Error> {
-        Self::version(version)
+        Self::generic_version(version)
     }
 }
 
@@ -249,22 +329,44 @@ impl EngineSemantics {
     /// The semantics this build executes.
     pub const CURRENT: Self = Self(ENGINE_SEMANTICS_VERSION);
 
-    /// Name a version of this crate's engine semantics line.
-    pub fn version(version: u16) -> std::result::Result<Self, PlanInputError> {
-        semantics_version(ENGINE_SEMANTICS_LINE, ENGINE_SEMANTICS_VERSION, version).map(Self)
+    /// Name a version of the engine semantics line `identity` binds.
+    pub fn version(
+        identity: &PlanIdentity,
+        version: u16,
+    ) -> std::result::Result<Self, PlanInputError> {
+        semantics_version(identity.engine_semantics, ENGINE_SEMANTICS_VERSION, version).map(Self)
+    }
+
+    /// `version` under Acativa's own identity lines — the generic dialect.
+    pub fn generic_version(version: u16) -> std::result::Result<Self, PlanInputError> {
+        Self::version(&ACATIVA_PLAN_IDENTITY, version)
     }
 
     pub const fn version_of(self) -> u16 {
         self.0
     }
 
-    /// The recorded form: `acativa.workflow.engine.v1`.
-    pub fn wire(self) -> String {
-        semantics_wire(ENGINE_SEMANTICS_LINE, self.0)
+    /// The recorded form under `identity`'s lines:
+    /// `acativa.workflow.engine.v1` for [`ACATIVA_PLAN_IDENTITY`].
+    pub fn wire(self, identity: &PlanIdentity) -> String {
+        semantics_wire(identity.engine_semantics, self.0)
     }
 
-    pub fn from_wire(value: &str) -> std::result::Result<Self, PlanInputError> {
-        parse_semantics_wire(ENGINE_SEMANTICS_LINE, ENGINE_SEMANTICS_VERSION, value).map(Self)
+    /// The recorded form under Acativa's own identity lines.
+    pub fn generic_wire(self) -> String {
+        self.wire(&ACATIVA_PLAN_IDENTITY)
+    }
+
+    pub fn from_wire(
+        identity: &PlanIdentity,
+        value: &str,
+    ) -> std::result::Result<Self, PlanInputError> {
+        parse_semantics_wire(identity.engine_semantics, ENGINE_SEMANTICS_VERSION, value).map(Self)
+    }
+
+    /// `from_wire` under Acativa's own identity lines.
+    pub fn generic_from_wire(value: &str) -> std::result::Result<Self, PlanInputError> {
+        Self::from_wire(&ACATIVA_PLAN_IDENTITY, value)
     }
 }
 
@@ -277,8 +379,10 @@ impl From<EngineSemantics> for u16 {
 impl TryFrom<u16> for EngineSemantics {
     type Error = PlanInputError;
 
+    /// Names a version of Acativa's own engine line. A host binding other
+    /// lines calls [`EngineSemantics::version`] with its `PlanIdentity`.
     fn try_from(version: u16) -> std::result::Result<Self, Self::Error> {
-        Self::version(version)
+        Self::generic_version(version)
     }
 }
 
@@ -462,16 +566,18 @@ impl PlanKey {
         &self.lowering_capabilities
     }
 
-    /// The canonical encoding of every field, in fixed order. Validated tags
-    /// cannot contain the separators, so the encoding is unambiguous.
-    pub fn canonical_bytes(&self) -> Vec<u8> {
+    /// The canonical encoding of every field, in fixed order, under the
+    /// binding-identity schema `identity` binds. Validated tags cannot contain
+    /// the separators, so the encoding is unambiguous.
+    pub fn canonical_bytes(&self, identity: &PlanIdentity) -> Vec<u8> {
         let capabilities = self
             .lowering_capabilities
             .iter()
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            "{BINDING_IDENTITY_SCHEMA}\0revision\0{}\0compiler\0{}\0engine\0{}\0capabilities\0{}\0",
+            "{}\0revision\0{}\0compiler\0{}\0engine\0{}\0capabilities\0{}\0",
+            identity.plan_key_schema,
             self.definition_revision.as_str(),
             self.compiler_semantics.version_of(),
             self.engine_semantics.version_of(),
@@ -480,13 +586,14 @@ impl PlanKey {
         .into_bytes()
     }
 
-    /// The stable identity of this plan.
+    /// The stable identity of this plan under `identity`'s lines.
     ///
     /// It is derived from the key alone, so rebuilding a plan that a cache
     /// evicted reproduces this value instead of minting a new one, and a run
-    /// bound to it stays bound.
-    pub fn binding_digest(&self) -> String {
-        sha256_hex(&self.canonical_bytes())
+    /// bound to it stays bound. Two identities digest the same key differently
+    /// on purpose: their persisted records must never alias.
+    pub fn binding_digest(&self, identity: &PlanIdentity) -> String {
+        sha256_hex(&self.canonical_bytes(identity))
     }
 }
 
@@ -509,28 +616,38 @@ pub struct RecordedPlanKey {
 }
 
 impl RecordedPlanKey {
-    pub fn typed(&self) -> std::result::Result<PlanKey, PlanInputError> {
-        Ok(PlanKey::new(
-            DefinitionRevision::from_wire(&self.definition_revision)?,
-            CompilerSemantics::from_wire(&self.compiler_semantics)?,
-            EngineSemantics::from_wire(&self.engine_semantics)?,
-            LoweringCapabilities::declare(self.lowering_capabilities.iter().map(String::as_str))?,
-        ))
-    }
-}
-
-impl From<&PlanKey> for RecordedPlanKey {
-    fn from(key: &PlanKey) -> Self {
+    /// The recorded form of `key` under `identity`'s lines — this is what a
+    /// checkpoint persists, so the lines are the host's own vocabulary.
+    pub fn record(key: &PlanKey, identity: &PlanIdentity) -> Self {
         Self {
             definition_revision: key.definition_revision().as_str().to_owned(),
-            compiler_semantics: key.compiler_semantics().wire(),
-            engine_semantics: key.engine_semantics().wire(),
+            compiler_semantics: key.compiler_semantics().wire(identity),
+            engine_semantics: key.engine_semantics().wire(identity),
             lowering_capabilities: key
                 .lowering_capabilities()
                 .iter()
                 .map(str::to_owned)
                 .collect(),
         }
+    }
+
+    /// Type the record under `identity`'s lines. A record that declares a
+    /// different line is refused rather than reinterpreted.
+    pub fn typed(&self, identity: &PlanIdentity) -> std::result::Result<PlanKey, PlanInputError> {
+        Ok(PlanKey::new(
+            DefinitionRevision::from_wire(&self.definition_revision)?,
+            CompilerSemantics::from_wire(identity, &self.compiler_semantics)?,
+            EngineSemantics::from_wire(identity, &self.engine_semantics)?,
+            LoweringCapabilities::declare(self.lowering_capabilities.iter().map(String::as_str))?,
+        ))
+    }
+}
+
+impl From<&PlanKey> for RecordedPlanKey {
+    /// Records under Acativa's own identity lines. A host binding other lines
+    /// calls [`RecordedPlanKey::record`] with its `PlanIdentity`.
+    fn from(key: &PlanKey) -> Self {
+        Self::record(key, &ACATIVA_PLAN_IDENTITY)
     }
 }
 
@@ -640,10 +757,16 @@ impl InterpreterProfile {
     }
 
     /// Whether this profile may advance a run from the binding a checkpoint
-    /// recorded. A record that cannot be typed is handed off: an unprovable
-    /// binding is never reinterpreted as this profile's semantics.
-    pub fn admit_recorded(&self, recorded: &RecordedPlanKey) -> RunAdmission {
-        match recorded.typed() {
+    /// recorded, typed under `identity`'s lines. A record that cannot be typed
+    /// — including one declaring a line `identity` does not bind — is handed
+    /// off: an unprovable binding is never reinterpreted as this profile's
+    /// semantics.
+    pub fn admit_recorded(
+        &self,
+        recorded: &RecordedPlanKey,
+        identity: &PlanIdentity,
+    ) -> RunAdmission {
+        match recorded.typed(identity) {
             Ok(key) => self.admit_run(&key),
             Err(_) => RunAdmission::Handoff {
                 reason: HandoffReason::UnprovenSemantics,
@@ -756,9 +879,9 @@ impl RetainedPlan {
     }
 
     /// The identity a run stays bound to, whether the lowered form exists now
-    /// or has to be rebuilt.
-    pub fn binding_digest(&self) -> String {
-        self.key.binding_digest()
+    /// or has to be rebuilt, digested under `identity`'s lines.
+    pub fn binding_digest(&self, identity: &PlanIdentity) -> String {
+        self.key.binding_digest(identity)
     }
 
     /// The canonical bytes a store persists.

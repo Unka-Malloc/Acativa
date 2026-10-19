@@ -86,9 +86,10 @@ pub use workflow::analysis::{
     compile_workflow_source, compile_workflow_value, validate_workflow_value,
 };
 pub use workflow::compile::{
-    CompiledWorkflow, CompilerSemantics, DefinitionRevision, EngineSemantics, HandoffReason,
-    InterpreterProfile, LoweringCapabilities, LoweringRefusal, PlanInputError, PlanKey,
-    PlanMismatch, RecordedPlanKey, RetainedPlan, RunAdmission,
+    ACATIVA_PLAN_IDENTITY, CompiledWorkflow, CompilerSemantics, DefinitionRevision,
+    EngineSemantics, HandoffReason, InterpreterProfile, LoweringCapabilities, LoweringRefusal,
+    PlanIdentity, PlanInputError, PlanKey, PlanMismatch, RecordedPlanKey, RetainedPlan,
+    RunAdmission,
 };
 pub use workflow::diagnostic::{
     PreflightDiagnostic, WorkflowDiagnosticActualKind, WorkflowDiagnosticCode,

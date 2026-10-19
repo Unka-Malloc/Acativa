@@ -22,7 +22,10 @@ use acativa::compile::{
     InterpreterProfile, LoweringCapabilities, LoweringRefusal, PlanKey, PlanMismatch,
     RecordedPlanKey, RetainedPlan, RunAdmission,
 };
-use acativa::{ReducerEvent, RunSnapshot, SchemaId, compile_workflow_source, reduce};
+use acativa::{
+    ACATIVA_PLAN_IDENTITY, PlanIdentity, ReducerEvent, RunSnapshot, SchemaId,
+    compile_workflow_source, reduce,
+};
 
 /// The fixture files describe one legacy workflow and the runs bound to it. The
 /// workflow is stored exactly as a package stores `workflow.json` — canonical
@@ -149,7 +152,7 @@ fn an_old_run_stays_on_a_compatible_interpreter() {
     // This build executes its own engine semantics, so it must not advance a run
     // bound to an earlier version of that line.
     assert_eq!(
-        this_build.admit_recorded(&older.recorded_plan_key),
+        this_build.admit_recorded(&older.recorded_plan_key, &ACATIVA_PLAN_IDENTITY),
         RunAdmission::Handoff {
             reason: HandoffReason::EngineSemantics
         }
@@ -165,7 +168,7 @@ fn an_old_run_stays_on_a_compatible_interpreter() {
     // and it is the same lowering: the identity does not move between them.
     let bound = older
         .recorded_plan_key
-        .typed()
+        .typed(&ACATIVA_PLAN_IDENTITY)
         .expect("the recorded binding types");
     let compatible = InterpreterProfile::new(
         bound.compiler_semantics(),
@@ -173,20 +176,22 @@ fn an_old_run_stays_on_a_compatible_interpreter() {
         LoweringCapabilities::none(),
     );
     assert_eq!(
-        compatible.admit_recorded(&older.recorded_plan_key),
+        compatible.admit_recorded(&older.recorded_plan_key, &ACATIVA_PLAN_IDENTITY),
         RunAdmission::Compatible
     );
     assert_eq!(compatible.key_for(fixture_revision()), bound);
     assert_eq!(
         this_build
             .key_for(fixture_revision())
-            .binding_digest()
+            .binding_digest(&ACATIVA_PLAN_IDENTITY)
             .len(),
         64
     );
     assert_ne!(
-        this_build.key_for(fixture_revision()).binding_digest(),
-        bound.binding_digest(),
+        this_build
+            .key_for(fixture_revision())
+            .binding_digest(&ACATIVA_PLAN_IDENTITY),
+        bound.binding_digest(&ACATIVA_PLAN_IDENTITY),
         "the two interpreters hold different identities for the same revision"
     );
 
@@ -195,7 +200,9 @@ fn an_old_run_stays_on_a_compatible_interpreter() {
     let this_build_key = this_build.key_for(fixture_revision());
     let recorded = RecordedPlanKey::from(&this_build_key);
     assert_eq!(
-        recorded.typed().expect("the recorded binding types"),
+        recorded
+            .typed(&ACATIVA_PLAN_IDENTITY)
+            .expect("the recorded binding types"),
         this_build_key
     );
 }
@@ -218,16 +225,19 @@ fn an_opaque_semantics_digest_is_never_reinterpreted() {
         fixture_revision().as_str()
     );
     assert!(
-        CompilerSemantics::from_wire(&opaque.recorded_plan_key.compiler_semantics).is_err(),
+        CompilerSemantics::generic_from_wire(&opaque.recorded_plan_key.compiler_semantics).is_err(),
         "a content digest is not a compiler semantics version"
     );
     assert!(
-        opaque.recorded_plan_key.typed().is_err(),
+        opaque
+            .recorded_plan_key
+            .typed(&ACATIVA_PLAN_IDENTITY)
+            .is_err(),
         "the record cannot be typed into a plan key"
     );
     // With no provable binding, the run is handed off rather than restarted here.
     assert_eq!(
-        this_build.admit_recorded(&opaque.recorded_plan_key),
+        this_build.admit_recorded(&opaque.recorded_plan_key, &ACATIVA_PLAN_IDENTITY),
         RunAdmission::Handoff {
             reason: HandoffReason::UnprovenSemantics
         }
@@ -243,7 +253,7 @@ fn a_run_bound_to_older_compiler_semantics_is_handed_off_not_relowered() {
     // The definition revision is the same input; the lowering semantics are
     // not, so this build must not advance the run.
     assert_eq!(
-        this_build.admit_recorded(&older.recorded_plan_key),
+        this_build.admit_recorded(&older.recorded_plan_key, &ACATIVA_PLAN_IDENTITY),
         RunAdmission::Handoff {
             reason: HandoffReason::CompilerSemantics
         }
@@ -259,7 +269,7 @@ fn a_run_bound_to_older_compiler_semantics_is_handed_off_not_relowered() {
     // same revision is a different plan.
     let bound = older
         .recorded_plan_key
-        .typed()
+        .typed(&ACATIVA_PLAN_IDENTITY)
         .expect("the recorded binding types");
     let compatible = InterpreterProfile::new(
         bound.compiler_semantics(),
@@ -267,7 +277,7 @@ fn a_run_bound_to_older_compiler_semantics_is_handed_off_not_relowered() {
         LoweringCapabilities::none(),
     );
     assert_eq!(
-        compatible.admit_recorded(&older.recorded_plan_key),
+        compatible.admit_recorded(&older.recorded_plan_key, &ACATIVA_PLAN_IDENTITY),
         RunAdmission::Compatible
     );
     let older_key = compatible.key_for(fixture_revision());
@@ -277,7 +287,10 @@ fn a_run_bound_to_older_compiler_semantics_is_handed_off_not_relowered() {
         current_key.definition_revision(),
         "both interpreters lower the same definition bytes"
     );
-    assert_ne!(older_key.binding_digest(), current_key.binding_digest());
+    assert_ne!(
+        older_key.binding_digest(&ACATIVA_PLAN_IDENTITY),
+        current_key.binding_digest(&ACATIVA_PLAN_IDENTITY)
+    );
 
     // This build has no lowering for that key at all: it cannot produce an
     // index and call it the v0 lowering.
@@ -295,8 +308,8 @@ fn a_record_that_omits_part_of_the_identity_is_refused() {
     // boundary.
     let incomplete = json!({
         "definitionRevision": fixture_revision().as_str(),
-        "compilerSemantics": CompilerSemantics::CURRENT.wire(),
-        "engineSemantics": EngineSemantics::CURRENT.wire(),
+        "compilerSemantics": CompilerSemantics::CURRENT.generic_wire(),
+        "engineSemantics": EngineSemantics::CURRENT.generic_wire(),
     });
     assert!(
         serde_json::from_value::<RecordedPlanKey>(incomplete.clone()).is_err(),
@@ -309,7 +322,9 @@ fn a_record_that_omits_part_of_the_identity_is_refused() {
     let recorded: RecordedPlanKey =
         serde_json::from_value(complete).expect("the complete record decodes");
     assert_eq!(
-        recorded.typed().expect("the complete record types"),
+        recorded
+            .typed(&ACATIVA_PLAN_IDENTITY)
+            .expect("the complete record types"),
         fixture_key(
             CompilerSemantics::CURRENT,
             EngineSemantics::CURRENT,
@@ -324,14 +339,20 @@ fn a_content_digest_is_not_a_semantics_version_anywhere() {
     let digest = revision.as_str();
 
     // Not through the version constructors...
-    assert!(CompilerSemantics::from_wire(digest).is_err());
-    assert!(EngineSemantics::from_wire(digest).is_err());
+    assert!(CompilerSemantics::generic_from_wire(digest).is_err());
+    assert!(EngineSemantics::generic_from_wire(digest).is_err());
     // ...not through a line that does not own the version...
-    assert!(CompilerSemantics::from_wire(&EngineSemantics::CURRENT.wire()).is_err());
-    assert!(EngineSemantics::from_wire(&CompilerSemantics::CURRENT.wire()).is_err());
+    assert!(
+        CompilerSemantics::generic_from_wire(&EngineSemantics::CURRENT.generic_wire()).is_err()
+    );
+    assert!(
+        EngineSemantics::generic_from_wire(&CompilerSemantics::CURRENT.generic_wire()).is_err()
+    );
     // ...and not through a version that does not exist yet.
-    assert!(CompilerSemantics::version(CompilerSemantics::CURRENT.version_of() + 1).is_err());
-    assert!(EngineSemantics::version(EngineSemantics::CURRENT.version_of() + 1).is_err());
+    assert!(
+        CompilerSemantics::generic_version(CompilerSemantics::CURRENT.version_of() + 1).is_err()
+    );
+    assert!(EngineSemantics::generic_version(EngineSemantics::CURRENT.version_of() + 1).is_err());
 
     // The typed key refuses the same substitution on the wire.
     let mut record = json!({
@@ -359,7 +380,7 @@ fn a_content_digest_is_not_a_semantics_version_anywhere() {
 #[test]
 fn the_revision_and_each_semantics_separate_identities() {
     let revision = fixture_revision();
-    let earlier = EngineSemantics::version(EngineSemantics::CURRENT.version_of() - 1)
+    let earlier = EngineSemantics::generic_version(EngineSemantics::CURRENT.version_of() - 1)
         .expect("an earlier version of the line is nameable");
 
     // Same revision, different engine semantics: a different plan identity.
@@ -374,7 +395,10 @@ fn the_revision_and_each_semantics_separate_identities() {
         LoweringCapabilities::none(),
     );
     assert_ne!(current_key, earlier_key);
-    assert_ne!(current_key.binding_digest(), earlier_key.binding_digest());
+    assert_ne!(
+        current_key.binding_digest(&ACATIVA_PLAN_IDENTITY),
+        earlier_key.binding_digest(&ACATIVA_PLAN_IDENTITY)
+    );
     assert_eq!(
         current_key.definition_revision(),
         earlier_key.definition_revision(),
@@ -392,7 +416,10 @@ fn the_revision_and_each_semantics_separate_identities() {
     )
     .expect("the edited key types");
     assert_ne!(current_key, edited_key);
-    assert_ne!(current_key.binding_digest(), edited_key.binding_digest());
+    assert_ne!(
+        current_key.binding_digest(&ACATIVA_PLAN_IDENTITY),
+        edited_key.binding_digest(&ACATIVA_PLAN_IDENTITY)
+    );
     assert_ne!(*edited_key.definition_revision(), revision);
 
     // The identity is a function of the key alone: asking twice never moves it.
@@ -402,7 +429,10 @@ fn the_revision_and_each_semantics_separate_identities() {
         LoweringCapabilities::none(),
     );
     assert_eq!(rebuilt_key, current_key);
-    assert_eq!(rebuilt_key.binding_digest(), current_key.binding_digest());
+    assert_eq!(
+        rebuilt_key.binding_digest(&ACATIVA_PLAN_IDENTITY),
+        current_key.binding_digest(&ACATIVA_PLAN_IDENTITY)
+    );
 }
 
 #[test]
@@ -431,8 +461,8 @@ fn lowering_capabilities_are_canonical_namespaced_and_checked() {
     );
     assert_eq!(with_capability, with_reversed);
     assert_eq!(
-        with_capability.binding_digest(),
-        with_reversed.binding_digest()
+        with_capability.binding_digest(&ACATIVA_PLAN_IDENTITY),
+        with_reversed.binding_digest(&ACATIVA_PLAN_IDENTITY)
     );
 
     for invalid in [
@@ -469,7 +499,8 @@ fn lowering_capabilities_are_canonical_namespaced_and_checked() {
     // the two keys is the engine version.
     let earlier_engine = fixture_key(
         CompilerSemantics::CURRENT,
-        EngineSemantics::version(EngineSemantics::CURRENT.version_of() - 1).expect("nameable"),
+        EngineSemantics::generic_version(EngineSemantics::CURRENT.version_of() - 1)
+            .expect("nameable"),
         declared.clone(),
     );
     let capable_host = InterpreterProfile::current(declared);
@@ -532,7 +563,10 @@ fn a_retained_plan_holds_the_definition_and_the_identity_only() {
     // Reading it back checks the pair against itself, then rebuilds the plan.
     let read = RetainedPlan::from_wire_bytes(&bytes).expect("the retained pair is consistent");
     assert_eq!(read.key(), &key);
-    assert_eq!(read.binding_digest(), key.binding_digest());
+    assert_eq!(
+        read.binding_digest(&ACATIVA_PLAN_IDENTITY),
+        key.binding_digest(&ACATIVA_PLAN_IDENTITY)
+    );
     assert_eq!(
         read.retained_bytes().expect("the retained form encodes"),
         bytes.len()
@@ -594,4 +628,65 @@ fn a_retained_pair_that_drifted_is_refused() {
         RetainedPlan::from_wire_bytes(&serde_json::to_vec(&value).expect("the form encodes")),
         Err(PlanMismatch::PlanEncoding { .. })
     ));
+}
+
+#[test]
+fn a_host_binds_its_own_plan_identity_lines() {
+    // A product host binds its own persisted lines; the values a host writes
+    // and accepts are spelled under them.
+    const HOST_IDENTITY: PlanIdentity = PlanIdentity::new(
+        "host.product.workflow.compiler",
+        "host.product.workflow.engine",
+        "host.product.workflow.plan-key.v1",
+    );
+
+    let key = fixture_key(
+        CompilerSemantics::CURRENT,
+        EngineSemantics::CURRENT,
+        LoweringCapabilities::none(),
+    );
+
+    // The host's own record round-trips into exactly the key it records, and
+    // the recorded strings carry the host's lines.
+    let recorded = RecordedPlanKey::record(&key, &HOST_IDENTITY);
+    assert_eq!(
+        recorded.compiler_semantics,
+        "host.product.workflow.compiler.v1"
+    );
+    assert_eq!(recorded.engine_semantics, "host.product.workflow.engine.v1");
+    assert_eq!(
+        recorded
+            .typed(&HOST_IDENTITY)
+            .expect("the host record types"),
+        key
+    );
+
+    // The same key digests differently under different identities: persisted
+    // records of two hosts never alias.
+    assert_ne!(
+        key.binding_digest(&HOST_IDENTITY),
+        key.binding_digest(&ACATIVA_PLAN_IDENTITY)
+    );
+
+    // A record written under Acativa's lines is not the host's record: typing
+    // refuses it rather than reinterpreting it as the host's semantics, and a
+    // profile asked to admit it hands the run off.
+    let generic_record = RecordedPlanKey::record(&key, &ACATIVA_PLAN_IDENTITY);
+    assert_eq!(
+        generic_record.compiler_semantics,
+        "acativa.workflow.compiler.v1"
+    );
+    assert!(generic_record.typed(&HOST_IDENTITY).is_err());
+    let host = InterpreterProfile::current(LoweringCapabilities::none());
+    assert_eq!(
+        host.admit_recorded(&generic_record, &HOST_IDENTITY),
+        RunAdmission::Handoff {
+            reason: HandoffReason::UnprovenSemantics
+        }
+    );
+    // The same record is fully valid under the identity that wrote it.
+    assert_eq!(
+        host.admit_recorded(&generic_record, &ACATIVA_PLAN_IDENTITY),
+        RunAdmission::Compatible
+    );
 }
