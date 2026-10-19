@@ -1,0 +1,99 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local env / secrets
+.env
+.env.local
+.env.*.local
+
+# Local generated and runtime assets
+*.log
+/build/
+coverage/
+.cache/
+outputs/
+reports/
+tmp/
+.tmp/
+
+# Node (auxiliary tooling only)
+node_modules/
+
+# Rust
+target/
+**/target/
+
+# Generated archives / binaries
+*.app
+*.AppImage
+*.asar
+*.dmg
+*.exe
+*.msi
+*.zip
+*.tar.gz
+*.tar.xz
+*.rar
+
+# Sensitive certificate, key, and provisioning material. Defense in depth only;
+# the local Git gates and the push Ruleset remain the effective publication
+# guards, and public-key-only suffixes (.pub, .asc, .gpg) stay trackable.
+*.cer
+*.cert
+*.csr
+*.certsigningrequest
+*.certSigningRequest
+*.crt
+*.der
+*.pem
+*.p7b
+*.p7c
+*.p12
+*.pfx
+*.pkcs12
+*.key
+*.p8
+*.pk8
+*.pkcs8
+*.jks
+*.keystore
+*.keychain
+*.keychain-db
+*.mobileprovision
+*.provisionprofile
+*.provisioningprofile
+
+# Local browser/test artifacts
+.playwright-cli/
+test-results/
+
+# Local planning, agent, and one-off work
+/report/
+/docs/plans/
+/docs/reports/
+/.agents/
+/.claude/
+/.codex/
+/.cursor/
+/.kilo/
+/skills/
+/scripts/local/
+/tools/local/
+.commandcode/
+.loopx/
+.lico-auditor/
+.better-plan.lock
+
+# Local-machine agent history replay corpus is developer-local only. It must
+# never enter the remote repository; regenerate via transcript-record ingest.
+tests/replay-corpus/
+
+# AGENTS.md is the tracked Agent guide when present. The other agent
+# entrypoints remain local-only.
+AGENT.md
+CLAUDE.md

@@ -1,0 +1,89 @@
+{
+  "schema": "acativa.legacy-run-fixture.v1",
+  "runs": [
+    {
+      "name": "engine-semantics-v0",
+      "snapshot": {
+        "runId": "run-legacy-v0",
+        "definitionDigest": "b227d67a05749e60ddeaea2af38c0519a9c7cbbb8340360d0b14ea88c515f7bf",
+        "semanticsDigest": "b227d67a05749e60ddeaea2af38c0519a9c7cbbb8340360d0b14ea88c515f7bf",
+        "status": "running",
+        "sequence": 3,
+        "input": {
+          "task": "review the fixture change"
+        },
+        "activeStates": [
+          "review"
+        ],
+        "completedStates": [],
+        "stateVisits": {
+          "review": 1
+        },
+        "joinArrivals": {},
+        "commands": {}
+      },
+      "recordedPlanKey": {
+        "definitionRevision": "b227d67a05749e60ddeaea2af38c0519a9c7cbbb8340360d0b14ea88c515f7bf",
+        "compilerSemantics": "acativa.workflow.compiler.v1",
+        "engineSemantics": "acativa.workflow.engine.v0",
+        "loweringCapabilities": []
+      }
+    },
+    {
+      "name": "opaque-semantics-digest",
+      "snapshot": {
+        "runId": "run-legacy-opaque",
+        "definitionDigest": "b227d67a05749e60ddeaea2af38c0519a9c7cbbb8340360d0b14ea88c515f7bf",
+        "semanticsDigest": "b227d67a05749e60ddeaea2af38c0519a9c7cbbb8340360d0b14ea88c515f7bf",
+        "status": "waiting",
+        "sequence": 5,
+        "input": {
+          "task": "review the fixture change"
+        },
+        "activeStates": [
+          "review"
+        ],
+        "completedStates": [],
+        "stateVisits": {
+          "review": 2
+        },
+        "joinArrivals": {},
+        "commands": {}
+      },
+      "recordedPlanKey": {
+        "definitionRevision": "b227d67a05749e60ddeaea2af38c0519a9c7cbbb8340360d0b14ea88c515f7bf",
+        "compilerSemantics": "b227d67a05749e60ddeaea2af38c0519a9c7cbbb8340360d0b14ea88c515f7bf",
+        "engineSemantics": "acativa.workflow.engine.v1",
+        "loweringCapabilities": []
+      }
+    },
+    {
+      "name": "compiler-semantics-v0",
+      "snapshot": {
+        "runId": "run-legacy-compiler-v0",
+        "definitionDigest": "b227d67a05749e60ddeaea2af38c0519a9c7cbbb8340360d0b14ea88c515f7bf",
+        "semanticsDigest": "b227d67a05749e60ddeaea2af38c0519a9c7cbbb8340360d0b14ea88c515f7bf",
+        "status": "running",
+        "sequence": 4,
+        "input": {
+          "task": "review the fixture change"
+        },
+        "activeStates": [
+          "review"
+        ],
+        "completedStates": [],
+        "stateVisits": {
+          "review": 1
+        },
+        "joinArrivals": {},
+        "commands": {}
+      },
+      "recordedPlanKey": {
+        "definitionRevision": "b227d67a05749e60ddeaea2af38c0519a9c7cbbb8340360d0b14ea88c515f7bf",
+        "compilerSemantics": "acativa.workflow.compiler.v0",
+        "engineSemantics": "acativa.workflow.engine.v1",
+        "loweringCapabilities": []
+      }
+    }
+  ]
+}

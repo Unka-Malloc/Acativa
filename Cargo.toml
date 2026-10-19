@@ -1,0 +1,8 @@
+[workspace]
+resolver = "3"
+members = ["crates/acativa"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.95.0"
+license = "AGPL-3.0-or-later"

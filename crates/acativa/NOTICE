@@ -1,0 +1,14 @@
+Acativa Open Source Notice
+
+Copyright (C) LicoLand contributors.
+
+Acativa is free software licensed under the GNU Affero General Public
+License, version 3 or later. A complete copy of that license is distributed
+with this project as "LICENSE".
+
+Acativa contains third-party open-source software declared in its Cargo
+manifests; the licenses and attribution notices of those dependencies are
+available through the published crate metadata.
+
+Acativa is provided without warranty to the extent permitted by the
+applicable license.

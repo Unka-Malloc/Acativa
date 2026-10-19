@@ -1,0 +1,27 @@
+[package]
+name = "acativa"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Multi-Agent Collaboration Strategy Compiler — generic runtime, state machine and durable strategy store"
+readme = "README.md"
+documentation = "https://docs.rs/acativa"
+keywords = ["workflow", "multi-agent", "state-machine", "collaboration", "runtime"]
+categories = ["data-structures", "rust-patterns"]
+
+[dependencies]
+anyhow = "1.0"
+flate2 = "1.0"
+rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2.0"
+uuid = { version = "1.11", features = ["v4", "serde"] }
+zip = { version = "9.0.3", default-features = false, features = ["deflate"] }
+
+[target.'cfg(unix)'.dependencies]
+# Private-path hardening and no-follow archive extraction open descriptors and
+# apply modes directly; the fs/user feature set matches the source workspace.
+nix = { version = "0.27", default-features = false, features = ["fs", "user"] }
