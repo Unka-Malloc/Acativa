@@ -6,7 +6,7 @@
 //! Re-enters execution results with source identity and pre-effect validity checks.
 
 use crate::adapter::AdapterExecutionStatus;
-use crate::control::{ControlOperation, VerifiedPrincipal};
+use crate::control::ControlOperation;
 use crate::node::{
     CancellationFacts, NodeExecutionError, NodeExecutionOutcome, NodeExecutionReceipt, NodeFacade,
     PauseResult, SteerResult, StopResult,
@@ -220,7 +220,10 @@ pub struct ContinuousNodeDriver {
     pub graph_id: String,
     pub nodes: BTreeMap<String, NodeFacade>,
     pub index: NodeFeatureIndex,
-    pub queue: FairDispatchQueue,
+    /// The dispatch queue is private: admitted work enters only through
+    /// `InterventionProxy` — handing the queue to callers would hand them a
+    /// path around the admission boundary.
+    queue: FairDispatchQueue,
     pub subscriptions: SubscriptionRegistry,
     pub active_invocations: BTreeMap<String, String>, // invocation_id -> node_id
     pub scope_barrier_active: bool,
@@ -396,7 +399,6 @@ impl ContinuousNodeDriver {
                 }
 
                 self.refresh_recipient_index(&payload.targets);
-                let principal = VerifiedPrincipal::local_admin(&payload.source_principal_id);
                 let validations = payload.targets.validate_before_effect(&self.index);
                 let op_str = format!("{:?}", payload.operation);
 
@@ -409,9 +411,7 @@ impl ContinuousNodeDriver {
                             if let Some(facade) = self.nodes.get_mut(&recipient.node_id) {
                                 match &payload.operation {
                                     ControlOperation::SubmitTask { input } => {
-                                        if let Ok(inv) =
-                                            facade.submit(input.clone(), &principal, item.cursor)
-                                        {
+                                        if let Ok(inv) = facade.submit(input.clone(), item.cursor) {
                                             inv_id = Some(inv.invocation_id.clone());
                                             self.active_invocations.insert(
                                                 inv.invocation_id.clone(),
@@ -955,11 +955,10 @@ mod tests {
         driver.register_node(facade);
 
         // Start task on node
-        let principal = VerifiedPrincipal::local_admin("admin");
         let inv = driver
             .get_node_mut("node-reentry")
             .unwrap()
-            .submit(json!({"compute": 123}), &principal, 1)
+            .submit(json!({"compute": 123}), 1)
             .unwrap();
 
         // Re-enter successful result with matching source identity
@@ -1018,12 +1017,10 @@ mod tests {
             None,
             None,
         ));
-
-        let principal = VerifiedPrincipal::local_admin("admin");
         let invocation = driver
             .get_node_mut("node-identity")
             .unwrap()
-            .submit(json!({"work": true}), &principal, 1)
+            .submit(json!({"work": true}), 1)
             .unwrap();
 
         let make_reentry =
@@ -1128,18 +1125,16 @@ mod tests {
             None,
         ));
 
-        let principal = VerifiedPrincipal::local_admin("admin");
-
         // Submit to A and B
         let inv_a = driver
             .get_node_mut("node-A")
             .unwrap()
-            .submit(json!({"step": "A"}), &principal, 1)
+            .submit(json!({"step": "A"}), 1)
             .unwrap();
         let _inv_b = driver
             .get_node_mut("node-B")
             .unwrap()
-            .submit(json!({"step": "B"}), &principal, 2)
+            .submit(json!({"step": "B"}), 2)
             .unwrap();
 
         // Both A and B are Running
@@ -1185,7 +1180,7 @@ mod tests {
         let _inv_c = driver
             .get_node_mut("node-C")
             .unwrap()
-            .submit(json!({"step": "C", "input_from_a": "done"}), &principal, 4)
+            .submit(json!({"step": "C", "input_from_a": "done"}), 4)
             .unwrap();
 
         // Now C is Running concurrently while B is still Running!
@@ -1224,17 +1219,15 @@ mod tests {
             None,
             None,
         ));
-
-        let principal = VerifiedPrincipal::local_admin("admin");
         let invocation_a = driver
             .get_node_mut("node-a")
             .unwrap()
-            .submit(json!({"node": "a"}), &principal, 1)
+            .submit(json!({"node": "a"}), 1)
             .unwrap();
         let invocation_b = driver
             .get_node_mut("node-b")
             .unwrap()
-            .submit(json!({"node": "b"}), &principal, 1)
+            .submit(json!({"node": "b"}), 1)
             .unwrap();
         driver
             .active_invocations
@@ -1288,13 +1281,11 @@ mod tests {
             None,
             None,
         ));
-
-        let principal = VerifiedPrincipal::local_admin("admin");
         // Start node-1 running, leave node-2 ready
         let invocation = driver
             .get_node_mut("node-1")
             .unwrap()
-            .submit(json!({}), &principal, 1)
+            .submit(json!({}), 1)
             .unwrap();
         driver
             .active_invocations
@@ -1369,11 +1360,10 @@ mod tests {
         driver.register_node(facade);
 
         // Submit task to node
-        let principal = VerifiedPrincipal::local_admin("admin");
         let inv = driver
             .get_node_mut("node-paused")
             .unwrap()
-            .submit(json!({"task": 1}), &principal, 1)
+            .submit(json!({"task": 1}), 1)
             .unwrap();
 
         // Request pause on running node: enters PauseRequested

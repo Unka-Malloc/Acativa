@@ -597,18 +597,31 @@ pub fn recheck_before_effect(
         });
     }
 
-    // 3. Resource Recheck: check single-writer lock and token budget limits
-    if let (Some(registry), Some(session)) = (ctx.single_writer_registry, ctx.session_id)
-        && let Some(active_writer) = registry.current_writer(session)
-        && active_writer != ctx.claimant
-    {
-        return Err(EffectRecheckFailure::ResourceUnavailable {
-            code: "session_writer_conflict".into(),
-            reason: format!(
-                "Session '{}' is currently locked by claimant '{}'",
-                session, active_writer
-            ),
-        });
+    // 3. Resource Recheck: check single-writer lock and token budget limits.
+    // When the caller asked for exclusivity, a session with no recorded
+    // writer cannot satisfy the recheck — an absent reservation is a
+    // missing fact, not a verified one, so it fails closed.
+    if let (Some(registry), Some(session)) = (ctx.single_writer_registry, ctx.session_id) {
+        match registry.current_writer(session) {
+            Some(active_writer) if active_writer != ctx.claimant => {
+                return Err(EffectRecheckFailure::ResourceUnavailable {
+                    code: "session_writer_conflict".into(),
+                    reason: format!(
+                        "Session '{}' is currently locked by claimant '{}'",
+                        session, active_writer
+                    ),
+                });
+            }
+            None => {
+                return Err(EffectRecheckFailure::ResourceUnavailable {
+                    code: "session_writer_missing".into(),
+                    reason: format!(
+                        "Session '{session}' has no recorded writer; exclusivity is unverified"
+                    ),
+                });
+            }
+            _ => {}
+        }
     }
 
     if let (Some(req), Some(remaining)) = (ctx.required_tokens, ctx.token_budget_remaining)

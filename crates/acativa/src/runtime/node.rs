@@ -9,7 +9,6 @@ use crate::adapter::{
     AdapterError, CancelOutcome, NodeCapabilityAdapter, NodeInvocation, PauseOutcome,
     ResumeOutcome, SingleWriterSessionRegistry, SteerOutcome,
 };
-use crate::control::VerifiedPrincipal;
 use crate::routing::{NodeCapability, NodeLifecycleState, NodeMetadata};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -248,10 +247,14 @@ impl NodeFacade {
     }
 
     /// Submit a task to this node.
+    ///
+    /// Authorization is upstream at `InterventionProxy::admit`: by the time
+    /// work reaches the facade it is already admitted, so submit takes no
+    /// principal — accepting one here would only pretend a second trust
+    /// boundary that does not exist.
     pub fn submit(
         &mut self,
         input: Value,
-        _principal: &VerifiedPrincipal,
         current_cursor: u64,
     ) -> Result<NodeInvocation, NodeExecutionError> {
         if self.stop_requested || self.lifecycle_state.is_stop_requested() {
@@ -731,9 +734,7 @@ mod tests {
             Some("session-1".to_string()),
             Some(registry.clone()),
         );
-
-        let principal = VerifiedPrincipal::local_admin("admin-1");
-        assert!(facade.submit(json!({"work": true}), &principal, 1).is_err());
+        assert!(facade.submit(json!({"work": true}), 1).is_err());
         assert_eq!(registry.current_writer("session-1"), None);
         assert_eq!(facade.lifecycle_state, NodeLifecycleState::Ready);
         assert!(facade.active_invocation.is_none());
@@ -748,10 +749,9 @@ mod tests {
         let mut facade = NodeFacade::new("node-1", "graph-1", 1, "worker", adapter, None, None);
 
         assert_eq!(facade.lifecycle_state, NodeLifecycleState::Ready);
-        let principal = VerifiedPrincipal::local_admin("admin-1");
 
         // Submit task
-        let inv = facade.submit(json!({"param": 42}), &principal, 10).unwrap();
+        let inv = facade.submit(json!({"param": 42}), 10).unwrap();
         assert_eq!(facade.lifecycle_state, NodeLifecycleState::Running);
         assert_eq!(facade.durable_cursor, 10);
         assert_eq!(
@@ -760,9 +760,7 @@ mod tests {
         );
 
         // Submitting while running fails with InvalidStateTransition
-        let err = facade
-            .submit(json!({"param": 43}), &principal, 11)
-            .unwrap_err();
+        let err = facade.submit(json!({"param": 43}), 11).unwrap_err();
         assert!(matches!(
             err,
             NodeExecutionError::InvalidStateTransition {
@@ -784,10 +782,7 @@ mod tests {
         assert!(facade.stop_requested);
 
         // Submit to stopped node fails monotonically
-        let principal = VerifiedPrincipal::local_admin("admin-1");
-        let err = facade
-            .submit(json!({"param": 1}), &principal, 1)
-            .unwrap_err();
+        let err = facade.submit(json!({"param": 1}), 1).unwrap_err();
         assert_eq!(err, NodeExecutionError::StopRequestedMonotonic);
     }
 
@@ -796,9 +791,7 @@ mod tests {
         let adapter =
             Arc::new(SyntheticCapabilityAdapter::new("steerable").with_inflight_steer(true));
         let mut facade = NodeFacade::new("node-steer", "graph-1", 1, "worker", adapter, None, None);
-
-        let principal = VerifiedPrincipal::local_admin("admin-1");
-        let inv = facade.submit(json!({}), &principal, 1).unwrap();
+        let inv = facade.submit(json!({}), 1).unwrap();
 
         // In-flight steer applies live
         let res = facade
@@ -847,9 +840,7 @@ mod tests {
     fn test_node_facade_pause_drain_and_observe_safe_boundary() {
         let adapter = Arc::new(CooperativeDrainAdapter::new("drain-adapter"));
         let mut facade = NodeFacade::new("node-pause", "graph-1", 1, "worker", adapter, None, None);
-
-        let principal = VerifiedPrincipal::local_admin("admin-1");
-        facade.submit(json!({}), &principal, 1).unwrap();
+        facade.submit(json!({}), 1).unwrap();
 
         // Request pause on running node with cooperative drain adapter
         let pause_res = facade.pause().unwrap();
@@ -877,8 +868,7 @@ mod tests {
         );
         let mut facade_ack =
             NodeFacade::new("node-ack", "graph-1", 1, "worker", ack_adapter, None, None);
-        let principal = VerifiedPrincipal::local_admin("admin-1");
-        facade_ack.submit(json!({}), &principal, 1).unwrap();
+        facade_ack.submit(json!({}), 1).unwrap();
 
         let stop_ack = facade_ack.stop("graceful shutdown").unwrap();
         assert!(matches!(stop_ack, StopResult::Stopped));
@@ -911,7 +901,7 @@ mod tests {
         );
         let mut facade_unk =
             NodeFacade::new("node-unk", "graph-1", 1, "worker", unk_adapter, None, None);
-        facade_unk.submit(json!({}), &principal, 1).unwrap();
+        facade_unk.submit(json!({}), 1).unwrap();
 
         let stop_unk = facade_unk.stop("cancel requested").unwrap();
         assert!(matches!(

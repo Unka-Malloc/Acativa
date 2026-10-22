@@ -884,32 +884,42 @@ impl StrategyStore {
         self.with_connection(|connection| load_run(connection, run_id))
     }
 
-    /// Prune retained event payloads for terminal runs, keeping the newest
-    /// `keep_per_run` rows of each.
+    /// Prune retained history for terminal runs, keeping the newest
+    /// `keep_per_run` event rows and pending transition intents of each.
     ///
-    /// Retention contract: event history is an audit trail the host owns —
-    /// the store appends every transition so `history_count` and replay
-    /// tooling stay complete for as long as the host needs them, and the
-    /// host bounds that growth by calling this on whatever cadence its
-    /// storage budget allows. Non-terminal runs are never touched: a live
-    /// run's history is still load-bearing.
+    /// Retention contract: event history and undelivered transition intents
+    /// are an audit trail the host owns — the store appends every
+    /// transition so `history_count` and replay tooling stay complete for
+    /// as long as the host needs them, and the host bounds that growth by
+    /// calling this on whatever cadence its storage budget allows.
+    /// Non-terminal runs are never touched: a live run's history and its
+    /// pending intents are still load-bearing.
     pub fn prune_terminal_events(&self, keep_per_run: u64) -> Result<u64> {
         self.with_connection(|connection| {
             let keep = keep_per_run.min(i64::MAX as u64) as i64;
-            connection
-                .execute(
-                    "DELETE FROM strategy_run_events
-                     WHERE run_id IN (SELECT run_id FROM strategy_runs WHERE terminal=1)
-                       AND sequence < COALESCE(
-                           (SELECT MIN(sequence) FROM (
-                               SELECT sequence FROM strategy_run_events retained
-                               WHERE retained.run_id = strategy_run_events.run_id
-                               ORDER BY sequence DESC LIMIT ?1)),
-                           9223372036854775807)",
-                    params![keep],
-                )
-                .map(|deleted| deleted as u64)
-                .map_err(Into::into)
+            let mut deleted = connection.execute(
+                "DELETE FROM strategy_run_events
+                 WHERE run_id IN (SELECT run_id FROM strategy_runs WHERE terminal=1)
+                   AND sequence < COALESCE(
+                       (SELECT MIN(sequence) FROM (
+                           SELECT sequence FROM strategy_run_events retained
+                           WHERE retained.run_id = strategy_run_events.run_id
+                           ORDER BY sequence DESC LIMIT ?1)),
+                       9223372036854775807)",
+                params![keep],
+            )?;
+            deleted += connection.execute(
+                "DELETE FROM workflow_transition_intents
+                 WHERE run_id IN (SELECT run_id FROM strategy_runs WHERE terminal=1)
+                   AND sequence < COALESCE(
+                       (SELECT MIN(sequence) FROM (
+                           SELECT sequence FROM workflow_transition_intents retained
+                           WHERE retained.run_id = workflow_transition_intents.run_id
+                           ORDER BY sequence DESC LIMIT ?1)),
+                       9223372036854775807)",
+                params![keep],
+            )?;
+            Ok(deleted as u64)
         })
     }
 
@@ -2918,12 +2928,12 @@ mod tests {
             StrategyRunStatus::Completed
         );
 
-        let count = |run_id: &str| -> i64 {
+        let count = |table: &str, run_id: &str| -> i64 {
             store
                 .with_connection(|connection| {
                     connection
                         .query_row(
-                            "SELECT COUNT(*) FROM strategy_run_events WHERE run_id=?1",
+                            &format!("SELECT COUNT(*) FROM {table} WHERE run_id=?1"),
                             params![run_id],
                             |row| row.get(0),
                         )
@@ -2931,16 +2941,24 @@ mod tests {
                 })
                 .unwrap()
         };
-        let terminal_events = count(&done.run_id);
-        let live_events = count(&live.run_id);
+        let terminal_events = count("strategy_run_events", &done.run_id);
+        let terminal_intents = count("workflow_transition_intents", &done.run_id);
+        let live_events = count("strategy_run_events", &live.run_id);
         assert!(terminal_events > 2 && live_events > 0);
 
-        // Keep only the newest event on the terminal run; the live run's
-        // history is still load-bearing and must be untouched.
+        // Keep only the newest row on the terminal run, in both tables; the
+        // live run's history is still load-bearing and must be untouched.
         let pruned = store.prune_terminal_events(1).unwrap();
-        assert_eq!(pruned, terminal_events as u64 - 1);
-        assert_eq!(count(&done.run_id), 1);
-        assert_eq!(count(&live.run_id), live_events);
+        assert_eq!(
+            pruned,
+            (terminal_events + terminal_intents - 2).max(0) as u64
+        );
+        assert_eq!(count("strategy_run_events", &done.run_id), 1);
+        assert_eq!(
+            count("workflow_transition_intents", &done.run_id),
+            terminal_intents.min(1)
+        );
+        assert_eq!(count("strategy_run_events", &live.run_id), live_events);
         // Idempotent: nothing left beyond the retained window.
         assert_eq!(store.prune_terminal_events(1).unwrap(), 0);
     }
