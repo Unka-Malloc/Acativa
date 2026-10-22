@@ -108,15 +108,22 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           DECLARED_SHA: ${{ steps.load.outputs.sha }}
+          DECLARED_MODE: ${{ steps.load.outputs.mode }}
         run: |
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" \
-            --jq '{path,conclusion,head_sha,head_branch}' | python3 -c "
+            --jq '{path,conclusion,head_sha,head_branch,event}' | python3 -c "
           import json, os, sys
           run = json.load(sys.stdin)
           assert run['path'] == '.github/workflows/verify.yml', \
               f\"not verify.yml: {run['path']}\"
           assert run['conclusion'] == 'success', \
               f\"run did not succeed: {run['conclusion']}\"
+          # The artifact's mode is candidate-produced data; the run's event
+          # is trusted metadata. A scheduled rehearsal can never carry the
+          # live mode, so a forged mode=live dies here.
+          if run['event'] == 'schedule':
+              assert os.environ['DECLARED_MODE'] == 'dry-run', \
+                  'scheduled verify run cannot be published live'
           with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
               out.write('ref=' + (run.get('head_branch') or '') + '\n')
               out.write('head_sha=' + run['head_sha'] + '\n')
@@ -173,6 +180,10 @@ jobs:
       NEXT: ${{ needs.gate.outputs.next }}
       NEEDS_SET: ${{ needs.gate.outputs.needs_set }}
       EXCLUDES: ${{ needs.gate.outputs.excludes }}
+      # An isolated cargo home plus running cargo from outside the checkout
+      # keeps a candidate .cargo/config.toml — a credential provider is an
+      # executable — from ever loading under the OIDC token.
+      CARGO_HOME: ${{ runner.temp }}/cargo-home
     defaults:
       run:
         shell: bash
@@ -206,9 +217,12 @@ jobs:
           python3 - <<'PY'
           import json, os, re, subprocess
           next_v = os.environ["NEXT"]
+          manifest = os.path.join(os.getcwd(), "Cargo.toml")
           meta = json.loads(subprocess.run(
-              ["cargo", "metadata", "--format-version", "1", "--no-deps"],
-              capture_output=True, text=True, check=True).stdout)
+              ["cargo", "metadata", "--format-version", "1", "--no-deps",
+               "--manifest-path", manifest],
+              capture_output=True, text=True, check=True,
+              cwd=os.environ["RUNNER_TEMP"]).stdout)
           members = set(meta["workspace_members"])
           packages = {p["name"]: p for p in meta["packages"] if p["id"] in members}
           old = {p["version"] for p in packages.values()}
@@ -228,10 +242,21 @@ jobs:
                   out.append(line)
               open(path, "w").writelines(out)
           PY
-          cargo update --workspace
-          git -c user.name="github-actions[bot]" \
-            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-            commit -qam "release: v$NEXT"
+          (cd "$RUNNER_TEMP" && cargo update --workspace \
+            --manifest-path "$GITHUB_WORKSPACE/Acativa/Cargo.toml")
+          git add -A -- ':(glob)**/Cargo.toml' ':(glob)**/Cargo.lock'
+          # Idempotent resume: if a previous run already promoted this exact
+          # bump tree to stable, adopt that commit — a fresh sibling commit
+          # would fail the stable push as non-fast-forward before the
+          # missing crates can be re-uploaded.
+          if [ "$(git write-tree)" = "$(git rev-parse 'origin/stable^{tree}' 2>/dev/null)" ]; then
+            git reset --hard -q origin/stable
+            echo "stable already carries v$NEXT; reusing its commit"
+          else
+            git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -qam "release: v$NEXT"
+          fi
 
       # HEAD already carries the version-bump commit when one was applied,
       # so promote HEAD — pushing $CANDIDATE would strand stable on the
@@ -252,8 +277,10 @@ jobs:
           python3 - <<'PY' > target/package/publish-order.txt
           import json, os, subprocess
           meta = json.loads(subprocess.run(
-              ["cargo", "metadata", "--format-version", "1"],
-              capture_output=True, text=True, check=True).stdout)
+              ["cargo", "metadata", "--format-version", "1",
+               "--manifest-path", os.path.join(os.getcwd(), "Cargo.toml")],
+              capture_output=True, text=True, check=True,
+              cwd=os.environ["RUNNER_TEMP"]).stdout)
           members = set(meta["workspace_members"])
           packages = {p["name"]: p for p in meta["packages"] if p["id"] in members}
           publishable = {n: p for n, p in packages.items()
@@ -276,7 +303,9 @@ jobs:
           PY
           args=()
           for crate in $EXCLUDES; do args+=(--exclude "$crate"); done
-          cargo package --workspace --allow-dirty --no-verify "${args[@]}"
+          (cd "$RUNNER_TEMP" && cargo package --workspace --allow-dirty \
+            --no-verify --manifest-path "$GITHUB_WORKSPACE/Acativa/Cargo.toml" \
+            "${args[@]}")
 
       # The whole upload loop lives in this workflow — the only file the OIDC
       # trust is bound to. The .crate set was packaged locally from the bound
@@ -323,7 +352,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          git tag "v$NEXT"
+          git rev-parse -q --verify "refs/tags/v$NEXT" >/dev/null || git tag "v$NEXT"
           git push origin "refs/tags/v$NEXT"
           if ! git push origin "HEAD:refs/heads/release"; then
             echo "::error::release branch not moved: v$NEXT is not a fast-forward of it"

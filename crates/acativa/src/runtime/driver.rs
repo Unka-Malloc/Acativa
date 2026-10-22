@@ -12,10 +12,11 @@ use crate::node::{
     PauseResult, SteerResult, StopResult,
 };
 use crate::routing::{
-    ActivationRule, ChannelKind, FairDispatchQueue, FrozenTargets, NodeFeatureIndex,
-    NodeLifecycleState, QueueCapacityExceeded, RecipientEffectStatus, SubscriptionPredicate,
-    SubscriptionRegistry, SubscriptionScope,
+    ActivationRule, FairDispatchQueue, FrozenTargets, NodeFeatureIndex, NodeLifecycleState,
+    RecipientEffectStatus, SubscriptionPredicate, SubscriptionRegistry, SubscriptionScope,
 };
+#[cfg(test)]
+use crate::routing::{ChannelKind, QueueCapacityExceeded};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
@@ -262,8 +263,12 @@ impl ContinuousNodeDriver {
         self.nodes.get_mut(node_id)
     }
 
-    /// Helper to enqueue an admitted message payload into the queue.
-    pub fn enqueue_admitted(
+    /// Test-only helper to enqueue an admitted message payload.
+    ///
+    /// Admission flows through `InterventionProxy`, the only boundary that
+    /// verifies the principal; this helper is test plumbing, not a host API.
+    #[cfg(test)]
+    fn enqueue_admitted(
         &mut self,
         channel: ChannelKind,
         item_id: impl Into<String>,

@@ -884,6 +884,35 @@ impl StrategyStore {
         self.with_connection(|connection| load_run(connection, run_id))
     }
 
+    /// Prune retained event payloads for terminal runs, keeping the newest
+    /// `keep_per_run` rows of each.
+    ///
+    /// Retention contract: event history is an audit trail the host owns —
+    /// the store appends every transition so `history_count` and replay
+    /// tooling stay complete for as long as the host needs them, and the
+    /// host bounds that growth by calling this on whatever cadence its
+    /// storage budget allows. Non-terminal runs are never touched: a live
+    /// run's history is still load-bearing.
+    pub fn prune_terminal_events(&self, keep_per_run: u64) -> Result<u64> {
+        self.with_connection(|connection| {
+            let keep = keep_per_run.min(i64::MAX as u64) as i64;
+            connection
+                .execute(
+                    "DELETE FROM strategy_run_events
+                     WHERE run_id IN (SELECT run_id FROM strategy_runs WHERE terminal=1)
+                       AND sequence < COALESCE(
+                           (SELECT MIN(sequence) FROM (
+                               SELECT sequence FROM strategy_run_events retained
+                               WHERE retained.run_id = strategy_run_events.run_id
+                               ORDER BY sequence DESC LIMIT ?1)),
+                           9223372036854775807)",
+                    params![keep],
+                )
+                .map(|deleted| deleted as u64)
+                .map_err(Into::into)
+        })
+    }
+
     pub fn apply_event(&self, run_id: &str, event: ReducerEvent) -> Result<RunSnapshot> {
         let committed = self.apply_event_with_commit(run_id, event)?;
         match committed {
@@ -1589,6 +1618,9 @@ fn initialize_schema_through(connection: &mut Connection) -> Result<()> {
          );
          CREATE INDEX IF NOT EXISTS strategy_commands_ready_idx
            ON strategy_commands(status, command_id);
+         CREATE INDEX IF NOT EXISTS strategy_commands_run_pending_idx
+           ON strategy_commands(run_id, command_id)
+           WHERE status='pending' AND kind!='authorization';
          CREATE INDEX IF NOT EXISTS strategy_commands_lease_idx
            ON strategy_commands(lease_until) WHERE status IN ('claimed', 'running');",
     )?;
@@ -2818,5 +2850,98 @@ mod tests {
         }
         drop(store);
         assert!(!dir.exists(), "scratch directory removed with the store");
+    }
+
+    #[test]
+    fn terminal_event_history_prunes_without_touching_live_runs() {
+        let store = StrategyStore::open_in_memory().unwrap();
+        let revision = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        store
+            .register_definition(
+                revision,
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                &workflow(),
+                1,
+                1,
+            )
+            .unwrap();
+        store
+            .update_binding(revision, "worker", "agent:test", "", "", None)
+            .unwrap();
+        let authorization = store.authorization_preview(revision).unwrap();
+        store
+            .grant_authorization(revision, &authorization.authorization_digest)
+            .unwrap();
+        let done = store
+            .start_run(revision, json!({}), "prune-terminal", None, None)
+            .unwrap();
+        let live = store
+            .start_run(revision, json!({}), "prune-live", None, None)
+            .unwrap();
+        let claimed = store
+            .claim_next_command(&done.run_id, "claimant", now_ms() + 60_000)
+            .unwrap()
+            .unwrap();
+        store
+            .apply_owned_event(
+                &done.run_id,
+                "claimant",
+                ReducerEvent::CommandStarted {
+                    command_id: claimed.id.clone(),
+                    attempt_token: claimed.attempt_token.clone(),
+                },
+            )
+            .unwrap();
+        store
+            .authorize_effect(
+                &done.run_id,
+                &claimed.id,
+                &claimed.attempt_token,
+                &authorization.authorization_digest,
+                "claimant",
+                now_ms() + 60_000,
+            )
+            .unwrap();
+        store
+            .apply_owned_event(
+                &done.run_id,
+                "claimant",
+                ReducerEvent::CommandSucceeded {
+                    command_id: claimed.id.clone(),
+                    attempt_token: claimed.attempt_token.clone(),
+                    output: json!({"ok": true}),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store.run(&done.run_id).unwrap().status,
+            StrategyRunStatus::Completed
+        );
+
+        let count = |run_id: &str| -> i64 {
+            store
+                .with_connection(|connection| {
+                    connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM strategy_run_events WHERE run_id=?1",
+                            params![run_id],
+                            |row| row.get(0),
+                        )
+                        .map_err(Into::into)
+                })
+                .unwrap()
+        };
+        let terminal_events = count(&done.run_id);
+        let live_events = count(&live.run_id);
+        assert!(terminal_events > 2 && live_events > 0);
+
+        // Keep only the newest event on the terminal run; the live run's
+        // history is still load-bearing and must be untouched.
+        let pruned = store.prune_terminal_events(1).unwrap();
+        assert_eq!(pruned, terminal_events as u64 - 1);
+        assert_eq!(count(&done.run_id), 1);
+        assert_eq!(count(&live.run_id), live_events);
+        // Idempotent: nothing left beyond the retained window.
+        assert_eq!(store.prune_terminal_events(1).unwrap(), 0);
     }
 }

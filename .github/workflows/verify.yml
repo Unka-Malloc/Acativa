@@ -77,10 +77,6 @@ jobs:
       sha: ${{ steps.candidate.outputs.sha }}
       branch: ${{ steps.candidate.outputs.branch }}
     env:
-      # The train's declared mode governs scheduled runs only; a manual or
-      # tag event releases live unless the dispatch opted into a rehearsal.
-      RELEASE_MODE: ${{ github.event_name == 'schedule' && 'dry-run' || inputs.rehearse && 'dry-run' || 'live' }}
-      RELEASE_KIND: ${{ github.event_name == 'schedule' && 'train' || 'manual' }}
       INPUT_VERSION: ${{ inputs.version }}
       INPUT_LEVEL: ${{ inputs.level }}
       SIBLINGS: '[]'
@@ -164,7 +160,10 @@ jobs:
       # The release train (default branch) reads this data-only file to
       # learn the candidate, the version decision and the kind of run; it
       # lands for every trigger so the gate job can short-circuit cleanly
-      # on rehearsals and unqualified candidates.
+      # on rehearsals and unqualified candidates. `kind` and `mode` are
+      # expanded from immutable run metadata (`github.event_name`, dispatch
+      # inputs) at this step — never from the job environment, which
+      # candidate-controlled test code could rewrite through GITHUB_ENV.
       - name: Record the release inputs
         if: always()
         run: |
@@ -173,8 +172,8 @@ jobs:
           sha=${{ steps.candidate.outputs.sha }}
           branch=${{ steps.candidate.outputs.branch }}
           release=${{ steps.version.outputs.release }}
-          kind=$RELEASE_KIND
-          mode=$RELEASE_MODE
+          kind=${{ github.event_name == 'schedule' && 'train' || 'manual' }}
+          mode=${{ github.event_name == 'schedule' && 'dry-run' || inputs.rehearse && 'dry-run' || 'live' }}
           next=${{ steps.version.outputs.next }}
           needs_set=${{ steps.version.outputs.needs_set }}
           excludes=${{ steps.version.outputs.excludes }}

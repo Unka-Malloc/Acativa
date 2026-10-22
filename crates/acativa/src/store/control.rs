@@ -551,17 +551,139 @@ pub trait ControlledStore: Send + Sync {
     /// The store assigns the monotonically increasing admission sequence on
     /// the receipt, persists the admitted control revision of the target
     /// node, and records the stop/pause negotiation facts implied by the
-    /// operation. `expected_control_revision` is verified against the
-    /// persisted revision inside the committing transaction, so competing
-    /// exclusive controls that read the same revision cannot both be
-    /// admitted; the committed revision the store assigned lands on
+    /// operation. `expected_control_revision` and every fence in `fences`
+    /// are re-verified inside the committing transaction, so a revocation,
+    /// stop, pause, barrier, or generation change committed between the
+    /// proxy's prechecks and this commit cannot admit a stale operation;
+    /// the committed revision the store assigned lands on
     /// `receipt.control_revision`.
     fn record_admission(
         &mut self,
         receipt: &mut AdmissionReceipt,
         payload_digest: String,
         expected_control_revision: Option<u64>,
+        fences: &AdmissionFences,
     ) -> Result<(), AdmissionConflict>;
+}
+
+/// The admission predicates `record_admission` re-evaluates under the same
+/// lock that writes the admission. What the proxy checked before opening
+/// the transaction is a preview; these fences are the authoritative read.
+#[derive(Clone, Debug, Default)]
+pub struct AdmissionFences {
+    /// Principal the operation was authorized as.
+    pub principal_id: String,
+    /// Every grant the principal holds that covers the required grant. An
+    /// empty set marks implicit local-admin authority, which grants cannot
+    /// revoke; a non-empty set admits only while at least one entry stays
+    /// unrevoked.
+    pub covering_grants: Vec<OperationGrant>,
+    /// Stop/pause fence key for the operation's scope.
+    pub target_scope: String,
+    /// Invocation-level stop key (`node/invocation`) when the operation
+    /// addresses a single invocation.
+    pub invocation_scope: Option<String>,
+    /// Caller's expected graph definition revision, when supplied.
+    pub expected_graph_revision: Option<u64>,
+    /// Caller's expected target lifecycle generation, when supplied.
+    pub expected_target_generation: Option<u64>,
+}
+
+/// The fence state one recheck observes, gathered under the store's write
+/// lock. `evaluate_fences` turns facts into the same conflict the
+/// pre-commit checks would have raised.
+#[derive(Clone, Debug)]
+pub(crate) struct FenceFacts {
+    pub covering_grants_all_revoked: bool,
+    pub barrier_active: bool,
+    pub stopped_scope: Option<String>,
+    pub invocation_settled: bool,
+    pub pause_negotiating: bool,
+    pub graph_revision: u64,
+    pub target_generation: u64,
+}
+
+/// Authoritative fence evaluation: identical conflicts to the proxy's
+/// prechecks, raised inside the committing transaction.
+pub(crate) fn evaluate_fences(
+    receipt: &AdmissionReceipt,
+    fences: &AdmissionFences,
+    facts: FenceFacts,
+) -> Result<(), AdmissionConflict> {
+    if !fences.covering_grants.is_empty() && facts.covering_grants_all_revoked {
+        return Err(AdmissionConflict::PermissionDenied {
+            principal_id: fences.principal_id.clone(),
+            graph_id: receipt.graph_id.clone(),
+            reason: "operation grant has been revoked".to_string(),
+        });
+    }
+    if facts.barrier_active
+        && let ControlOperation::SubmitTask { .. } = receipt.operation
+    {
+        return Err(AdmissionConflict::ScopeAdmissionBarrier {
+            graph_id: receipt.graph_id.clone(),
+            reason: "graph scope admission barrier active; new tasks blocked".to_string(),
+        });
+    }
+    if let Some(target) = facts.stopped_scope {
+        match &receipt.operation {
+            ControlOperation::Steer { .. } | ControlOperation::Resume { .. } => {
+                return Err(AdmissionConflict::StopMonotonicViolation {
+                    target,
+                    reason:
+                        "stop-requested is monotonic; later steer or resume cannot resurrect it"
+                            .to_string(),
+                });
+            }
+            // Stop-requested prevents new work in the scope; a new task
+            // needs its own identity and an admitting scope.
+            ControlOperation::SubmitTask { .. } => {
+                return Err(AdmissionConflict::StopMonotonicViolation {
+                    target,
+                    reason: "stop-requested scope does not admit new work".to_string(),
+                });
+            }
+            _ => {}
+        }
+    }
+    if let ControlOperation::Steer { invocation_id, .. } = &receipt.operation
+        && let Some(node) = receipt.target_node_id.as_deref()
+        && facts.invocation_settled
+    {
+        return Err(AdmissionConflict::InvocationSettled {
+            target_node_id: node.to_string(),
+            invocation_id: invocation_id.clone(),
+            reason: "invocation already completed before steer arrived".to_string(),
+        });
+    }
+    if let ControlOperation::Resume { .. } = receipt.operation
+        && facts.pause_negotiating
+    {
+        return Err(AdmissionConflict::PendingTransition {
+            target: fences.target_scope.clone(),
+            current_state: "pause_negotiating".to_string(),
+            pending_action: "drain_in_progress".to_string(),
+        });
+    }
+    if let Some(expected_rev) = fences.expected_graph_revision
+        && expected_rev != facts.graph_revision
+    {
+        return Err(AdmissionConflict::RevisionConflict {
+            expected: expected_rev,
+            current: facts.graph_revision,
+            reason: "stale graph revision; proposal must rebase".to_string(),
+        });
+    }
+    if let Some(expected_gen) = fences.expected_target_generation
+        && expected_gen != facts.target_generation
+    {
+        return Err(AdmissionConflict::StaleTargetGeneration {
+            target: fences.target_scope.clone(),
+            expected_generation: expected_gen,
+            current_generation: facts.target_generation,
+        });
+    }
+    Ok(())
 }
 
 /// In-memory controlled store implementing `ControlledStore` for tests and isolated execution.
@@ -739,7 +861,88 @@ impl ControlledStore for InMemoryControlledStore {
         receipt: &mut AdmissionReceipt,
         payload_digest: String,
         expected_control_revision: Option<u64>,
+        fences: &AdmissionFences,
     ) -> Result<(), AdmissionConflict> {
+        // Re-evaluate the fences the proxy previewed: this commit is the
+        // authoritative read, so a fence raised since the prechecks still
+        // rejects the operation.
+        let stopped_scope = if self
+            .stop_requested_targets
+            .contains(&(receipt.graph_id.clone(), fences.target_scope.clone()))
+            || self
+                .stop_requested_targets
+                .contains(&(receipt.graph_id.clone(), "graph".to_string()))
+        {
+            Some(fences.target_scope.clone())
+        } else {
+            fences.invocation_scope.clone().filter(|key| {
+                self.stop_requested_targets
+                    .contains(&(receipt.graph_id.clone(), key.clone()))
+            })
+        };
+        evaluate_fences(
+            receipt,
+            fences,
+            FenceFacts {
+                covering_grants_all_revoked: !fences.covering_grants.is_empty()
+                    && fences.covering_grants.iter().all(|grant| {
+                        self.revoked_grants
+                            .contains(&(fences.principal_id.clone(), grant.clone()))
+                    }),
+                barrier_active: self.graph_barriers.contains(&receipt.graph_id),
+                stopped_scope,
+                invocation_settled: matches!(&receipt.operation, ControlOperation::Steer { .. })
+                    && receipt.target_node_id.as_ref().is_some_and(|node| {
+                        match &receipt.operation {
+                            ControlOperation::Steer { invocation_id, .. } => {
+                                self.settled_invocations.contains(&(
+                                    receipt.graph_id.clone(),
+                                    node.clone(),
+                                    invocation_id.clone(),
+                                ))
+                            }
+                            _ => false,
+                        }
+                    }),
+                pause_negotiating: self
+                    .pause_negotiating_targets
+                    .contains(&(receipt.graph_id.clone(), fences.target_scope.clone())),
+                graph_revision: self
+                    .graph_revisions
+                    .get(&receipt.graph_id)
+                    .copied()
+                    .unwrap_or(1),
+                target_generation: self
+                    .target_generations
+                    .get(&(receipt.graph_id.clone(), fences.target_scope.clone()))
+                    .copied()
+                    .unwrap_or(1),
+            },
+        )?;
+        receipt.graph_revision = self
+            .graph_revisions
+            .get(&receipt.graph_id)
+            .copied()
+            .unwrap_or(1);
+
+        // Idempotency is re-checked here so two identical requests committed
+        // back-to-back converge on the recorded receipt instead of violating
+        // the unique constraint.
+        if let Some((existing_receipt, existing_digest)) =
+            self.idempotency_log.get(&receipt.request_id).cloned()
+        {
+            if existing_digest == payload_digest {
+                *receipt = existing_receipt;
+                receipt.is_replay = true;
+                return Ok(());
+            }
+            return Err(AdmissionConflict::IdempotencyMismatch {
+                request_id: receipt.request_id.clone(),
+                existing_author: existing_receipt.author_principal_id,
+                reason: "request_id reused with different command payload".to_string(),
+            });
+        }
+
         receipt.admitted_sequence = self.next_sequence;
         self.next_sequence += 1;
 
@@ -896,17 +1099,10 @@ impl<S: ControlledStore> InterventionProxy<S> {
             }
         }
 
-        // 3. Graph scope barrier check
-        if self.store.is_graph_barrier_active(&request.graph_id)?
-            && let ControlOperation::SubmitTask { .. } = request.operation
-        {
-            return Err(AdmissionConflict::ScopeAdmissionBarrier {
-                graph_id: request.graph_id,
-                reason: "graph scope admission barrier active; new tasks blocked".to_string(),
-            });
-        }
-
-        // 4. Monotonic Stop check
+        // The stop, pause, barrier, revision and generation fences below are
+        // previews only: `record_admission` re-evaluates all of them under
+        // the same lock that commits the admission, so a fence committed
+        // between here and there still rejects the operation.
         let target_scope_str = match &request.operation {
             ControlOperation::Pause { scope }
             | ControlOperation::Resume { scope }
@@ -933,130 +1129,38 @@ impl<S: ControlledStore> InterventionProxy<S> {
             } => Some(format!("{}/{}", node_id, invocation_id)),
             _ => None,
         };
-        let stopped_target = if self
-            .store
-            .is_stop_requested(&request.graph_id, &target_scope_str)?
-        {
-            Some(target_scope_str.clone())
-        } else {
-            match invocation_scope_str {
-                Some(key) if self.store.is_stop_requested(&request.graph_id, &key)? => Some(key),
-                _ => None,
-            }
+
+        // 3. Durable receipt creation & commit. The store fills in
+        // `graph_revision` and, for node-scoped operations, the committed
+        // `control_revision`; a graph-scoped operation keeps revision 1.
+        let graph_scoped = target_node.is_none();
+        let fences = AdmissionFences {
+            principal_id,
+            covering_grants: if principal.is_local_admin() {
+                Vec::new()
+            } else {
+                principal
+                    .covering_grants(&required_grant)
+                    .into_iter()
+                    .cloned()
+                    .collect()
+            },
+            target_scope: target_scope_str,
+            invocation_scope: invocation_scope_str,
+            expected_graph_revision: request.expected_graph_revision,
+            expected_target_generation: request.expected_target_generation,
         };
-
-        if let Some(target) = stopped_target {
-            match &request.operation {
-                ControlOperation::Steer { .. } | ControlOperation::Resume { .. } => {
-                    return Err(AdmissionConflict::StopMonotonicViolation {
-                        target,
-                        reason:
-                            "stop-requested is monotonic; later steer or resume cannot resurrect it"
-                                .to_string(),
-                    });
-                }
-                // Stop-requested prevents new work in the scope; a new task
-                // needs its own identity and an admitting scope.
-                ControlOperation::SubmitTask { .. } => {
-                    return Err(AdmissionConflict::StopMonotonicViolation {
-                        target,
-                        reason: "stop-requested scope does not admit new work".to_string(),
-                    });
-                }
-                _ => {}
-            }
-        }
-
-        // 5. Steer races with completion
-        if let ControlOperation::Steer { invocation_id, .. } = &request.operation
-            && let Some(node) = target_node
-            && self
-                .store
-                .is_invocation_settled(&request.graph_id, node, invocation_id)?
-        {
-            return Err(AdmissionConflict::InvocationSettled {
-                target_node_id: node.to_string(),
-                invocation_id: invocation_id.clone(),
-                reason: "invocation already completed before steer arrived".to_string(),
-            });
-        }
-
-        // 6. Resume arrives while pause is being negotiated
-        if let ControlOperation::Resume { .. } = request.operation
-            && self
-                .store
-                .is_pause_negotiating(&request.graph_id, &target_scope_str)?
-        {
-            return Err(AdmissionConflict::PendingTransition {
-                target: target_scope_str,
-                current_state: "pause_negotiating".to_string(),
-                pending_action: "drain_in_progress".to_string(),
-            });
-        }
-
-        // 7. Graph definition revision check
-        let current_graph_rev = self
-            .store
-            .get_graph_revision(&request.graph_id)?
-            .unwrap_or(1);
-        if let Some(expected_rev) = request.expected_graph_revision
-            && expected_rev != current_graph_rev
-        {
-            return Err(AdmissionConflict::RevisionConflict {
-                expected: expected_rev,
-                current: current_graph_rev,
-                reason: "stale graph revision; proposal must rebase".to_string(),
-            });
-        }
-
-        // 8. Exclusive node control revision check — a pre-transaction
-        // preview only; the durable store re-verifies it inside the commit.
-        let current_control_rev = if let Some(node) = target_node {
-            self.store
-                .get_node_control_revision(&request.graph_id, node)?
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        if let Some(expected_control_rev) = request.expected_control_revision
-            && expected_control_rev != current_control_rev
-        {
-            return Err(AdmissionConflict::ControlRevisionConflict {
-                target_node_id: target_node.unwrap_or("graph").to_string(),
-                expected: expected_control_rev,
-                current: current_control_rev,
-                reason: "competing exclusive control revision conflict".to_string(),
-            });
-        }
-
-        // 9. Stale target generation check
-        if let Some(expected_gen) = request.expected_target_generation {
-            let current_gen = self
-                .store
-                .get_target_generation(&request.graph_id, &target_scope_str)?
-                .unwrap_or(1);
-            if expected_gen != current_gen {
-                return Err(AdmissionConflict::StaleTargetGeneration {
-                    target: target_scope_str,
-                    expected_generation: expected_gen,
-                    current_generation: current_gen,
-                });
-            }
-        }
-
-        // 10. Durable receipt creation & commit
-        let next_control_rev = current_control_rev + 1;
         let mut receipt = AdmissionReceipt {
             // Assigned from the store's durable sequence counter at commit.
             admitted_sequence: 0,
             request_id: request.request_id,
             graph_id: request.graph_id,
             target_node_id: request.target_node_id,
-            author_principal_id: principal_id,
+            author_principal_id: fences.principal_id.clone(),
             admitted_at_unix_ms: request.timestamp_unix_ms,
             operation: request.operation,
-            graph_revision: current_graph_rev,
-            control_revision: next_control_rev,
+            graph_revision: 0,
+            control_revision: u64::from(graph_scoped),
             is_replay: false,
         };
 
@@ -1064,6 +1168,7 @@ impl<S: ControlledStore> InterventionProxy<S> {
             &mut receipt,
             payload_digest,
             request.expected_control_revision,
+            &fences,
         )?;
         Ok(receipt)
     }

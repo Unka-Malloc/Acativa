@@ -4,8 +4,8 @@ use anyhow::{Result, ensure};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use crate::control::{
-    AdmissionConflict, AdmissionReceipt, ControlOperation, ControlScope, ControlledStore,
-    OperationGrant,
+    AdmissionConflict, AdmissionFences, AdmissionReceipt, ControlOperation, ControlScope,
+    ControlledStore, FenceFacts, OperationGrant, evaluate_fences,
 };
 use crate::routing::{ChannelKind, QueueBounds};
 
@@ -351,12 +351,129 @@ impl ControlledStore for DurableControlledStore {
         receipt: &mut AdmissionReceipt,
         payload_digest: String,
         expected_control_revision: Option<u64>,
+        fences: &AdmissionFences,
     ) -> Result<(), AdmissionConflict> {
         self.store.with_connection_typed(
             |connection| -> std::result::Result<(), AdmissionConflict> {
                 let transaction = connection
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(AdmissionConflict::from)?;
+                // Idempotency is re-read under the write lock: two identical
+                // requests admitted back-to-back converge on the recorded
+                // receipt instead of tripping the unique constraint.
+                let existing: Option<(String, String)> = transaction
+                    .query_row(
+                        "SELECT receipt_json, payload_digest FROM workflow_control_admissions
+                         WHERE request_id=?1",
+                        params![receipt.request_id],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .optional()?;
+                if let Some((receipt_json, existing_digest)) = existing {
+                    if existing_digest == payload_digest {
+                        *receipt = serde_json::from_str(&receipt_json)?;
+                        receipt.is_replay = true;
+                        transaction.commit()?;
+                        return Ok(());
+                    }
+                    let existing_receipt: AdmissionReceipt = serde_json::from_str(&receipt_json)?;
+                    return Err(AdmissionConflict::IdempotencyMismatch {
+                        request_id: receipt.request_id.clone(),
+                        existing_author: existing_receipt.author_principal_id,
+                        reason: "request_id reused with different command payload".to_string(),
+                    });
+                }
+                // Every admission fence is re-evaluated under the write lock
+                // that commits this admission: a revocation, stop, pause,
+                // barrier or generation change committed between the proxy's
+                // prechecks and now still rejects the operation.
+                let mut covering_grants_all_revoked = !fences.covering_grants.is_empty();
+                for grant in &fences.covering_grants {
+                    let count: i64 = transaction.query_row(
+                        "SELECT COUNT(*) FROM workflow_revoked_grants
+                         WHERE principal_id=?1 AND grant_json=?2",
+                        params![fences.principal_id, serde_json::to_string(grant)?],
+                        |row| row.get(0),
+                    )?;
+                    if count == 0 {
+                        covering_grants_all_revoked = false;
+                        break;
+                    }
+                }
+                let barrier_active: i64 = transaction
+                    .query_row(
+                        "SELECT barrier_active FROM workflow_graph_state WHERE graph_id=?1",
+                        params![receipt.graph_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .unwrap_or(0);
+                let stop_hit = |target: &str| -> Result<bool, rusqlite::Error> {
+                    let count: i64 = transaction.query_row(
+                        "SELECT COUNT(*) FROM workflow_stop_requests
+                         WHERE graph_id=?1 AND target IN (?2, 'graph')",
+                        params![receipt.graph_id, target],
+                        |row| row.get(0),
+                    )?;
+                    Ok(count != 0)
+                };
+                let stopped_scope = if stop_hit(&fences.target_scope)? {
+                    Some(fences.target_scope.clone())
+                } else {
+                    match &fences.invocation_scope {
+                        Some(key) if stop_hit(key)? => Some(key.clone()),
+                        _ => None,
+                    }
+                };
+                let invocation_settled = match (&receipt.operation, &receipt.target_node_id) {
+                    (ControlOperation::Steer { invocation_id, .. }, Some(node)) => {
+                        let count: i64 = transaction.query_row(
+                            "SELECT COUNT(*) FROM workflow_invocations
+                             WHERE graph_id=?1 AND node_id=?2 AND invocation_id=?3 AND settled=1",
+                            params![receipt.graph_id, node, invocation_id],
+                            |row| row.get(0),
+                        )?;
+                        count != 0
+                    }
+                    _ => false,
+                };
+                let pause_negotiating: i64 = transaction.query_row(
+                    "SELECT COUNT(*) FROM workflow_pause_requests
+                     WHERE graph_id=?1 AND target=?2 AND active=1",
+                    params![receipt.graph_id, fences.target_scope],
+                    |row| row.get(0),
+                )?;
+                let graph_revision: i64 = transaction
+                    .query_row(
+                        "SELECT graph_revision FROM workflow_graph_state WHERE graph_id=?1",
+                        params![receipt.graph_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .unwrap_or(1);
+                let target_generation: i64 = transaction
+                    .query_row(
+                        "SELECT generation FROM workflow_node_state
+                         WHERE graph_id=?1 AND node_id=?2",
+                        params![receipt.graph_id, fences.target_scope],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .unwrap_or(1);
+                evaluate_fences(
+                    receipt,
+                    fences,
+                    FenceFacts {
+                        covering_grants_all_revoked,
+                        barrier_active: barrier_active == 1,
+                        stopped_scope,
+                        invocation_settled,
+                        pause_negotiating: pause_negotiating != 0,
+                        graph_revision: graph_revision.max(0) as u64,
+                        target_generation: target_generation.max(0) as u64,
+                    },
+                )?;
+                receipt.graph_revision = graph_revision.max(0) as u64;
                 // The exclusive-control fence is a compare-and-swap, not a
                 // pre-txn read: the persisted revision is re-read under the write
                 // lock, so two proxies that both observed the same revision cannot
@@ -594,7 +711,12 @@ mod tests {
                 is_replay: false,
             };
             control
-                .record_admission(&mut receipt, "digest".into(), Some(9))
+                .record_admission(
+                    &mut receipt,
+                    "digest".into(),
+                    Some(9),
+                    &AdmissionFences::default(),
+                )
                 .unwrap();
             assert_eq!(receipt.admitted_sequence, 1);
         }
@@ -676,13 +798,23 @@ mod tests {
             // Both proxies read revision 9; the first commits 10.
             let mut first = make_receipt("request-a");
             control
-                .record_admission(&mut first, "digest-a".into(), Some(9))
+                .record_admission(
+                    &mut first,
+                    "digest-a".into(),
+                    Some(9),
+                    &AdmissionFences::default(),
+                )
                 .unwrap();
             assert_eq!(first.control_revision, 10);
             // The second still pins 9 and conflicts at commit.
             let mut second = make_receipt("request-b");
             let conflict = control
-                .record_admission(&mut second, "digest-b".into(), Some(9))
+                .record_admission(
+                    &mut second,
+                    "digest-b".into(),
+                    Some(9),
+                    &AdmissionFences::default(),
+                )
                 .expect_err("a stale expected revision cannot admit");
             assert!(matches!(
                 conflict,
