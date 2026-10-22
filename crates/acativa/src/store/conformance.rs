@@ -2482,8 +2482,9 @@ fn durable_claim_bounds_each_run_and_releases_capacity_in_stable_order() {
         "run maxParallelism must cap claims"
     );
     store
-        .apply_event(
+        .apply_owned_event(
             &run.run_id,
+            "claimant",
             ReducerEvent::CommandSucceeded {
                 command_id: claimed[0].id.clone(),
                 attempt_token: claimed[0].attempt_token.clone(),
@@ -2532,8 +2533,9 @@ fn durable_claim_never_exceeds_the_engine_ceiling_across_runs() {
         "the engine-wide effect ceiling must reject further claims"
     );
     store
-        .apply_event(
+        .apply_owned_event(
             &run_a.run_id,
+            "claimant",
             ReducerEvent::CommandSucceeded {
                 command_id: claimed[0].id.clone(),
                 attempt_token: claimed[0].attempt_token.clone(),
@@ -2546,4 +2548,67 @@ fn durable_claim_never_exceeds_the_engine_ceiling_across_runs() {
         .unwrap()
         .expect("releasing one effect must admit the next claim");
     assert!(released.id.starts_with("command:"));
+}
+
+#[test]
+fn a_partially_acknowledged_cancel_stays_in_doubt() {
+    let store = StrategyStore::open_in_memory().unwrap();
+    let run = register_workset_run(&store, 20, 2, 2, "cancel-in-doubt");
+    let first = store
+        .claim_next_command(&run.run_id, "claimant", now_ms() + 60_000)
+        .unwrap()
+        .expect("first claim");
+    let second = store
+        .claim_next_command(&run.run_id, "claimant", now_ms() + 60_000)
+        .unwrap()
+        .expect("second claim");
+    for command in [&first, &second] {
+        store
+            .apply_owned_event(
+                &run.run_id,
+                "claimant",
+                ReducerEvent::CommandStarted {
+                    command_id: command.id.clone(),
+                    attempt_token: command.attempt_token.clone(),
+                },
+            )
+            .unwrap();
+    }
+    store
+        .apply_event(&run.run_id, ReducerEvent::CancelRequested)
+        .unwrap();
+
+    // One position's outcome is unknowable; the other acknowledges its cancel.
+    store
+        .apply_owned_event(
+            &run.run_id,
+            "claimant",
+            ReducerEvent::CancellationUnknown {
+                command_id: first.id.clone(),
+                attempt_token: first.attempt_token.clone(),
+            },
+        )
+        .unwrap();
+    store
+        .apply_owned_event(
+            &run.run_id,
+            "claimant",
+            ReducerEvent::CancellationAcknowledged {
+                command_id: second.id.clone(),
+                attempt_token: second.attempt_token.clone(),
+            },
+        )
+        .unwrap();
+
+    let snapshot = store.run(&run.run_id).unwrap();
+    assert_eq!(
+        snapshot.commands[&second.id].status,
+        CommandStatus::Cancelled
+    );
+    assert_eq!(snapshot.commands[&first.id].status, CommandStatus::InDoubt);
+    assert_eq!(
+        snapshot.status,
+        StrategyRunStatus::CancelInDoubt,
+        "a run with an in-doubt position may never report Cancelled"
+    );
 }

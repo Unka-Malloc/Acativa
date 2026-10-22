@@ -2436,6 +2436,7 @@ impl Machine<'_> {
         }
         self.snapshot.pending_callbacks.clear();
         let mut in_flight = false;
+        let mut in_doubt = false;
         let cancellable = self
             .snapshot
             .commands
@@ -2451,10 +2452,17 @@ impl Machine<'_> {
                     self.set_command_status(&command_id, CommandStatus::CancelRequested);
                     in_flight = true;
                 }
+                // A command whose effect outcome is unknown is not
+                // cancellable: reporting the run cancelled while an external
+                // effect may still have happened would lie about the world.
+                CommandStatus::InDoubt => in_doubt = true,
                 _ => {}
             }
         }
-        self.snapshot.status = if in_flight {
+        self.snapshot.status = if in_doubt {
+            self.snapshot.diagnostic_code = Some("cancellation_outcome_unknown".into());
+            StrategyRunStatus::CancelInDoubt
+        } else if in_flight {
             StrategyRunStatus::CancelRequested
         } else {
             StrategyRunStatus::Cancelled
@@ -2475,7 +2483,18 @@ impl Machine<'_> {
                 CommandStatus::Running | CommandStatus::CancelRequested
             )
         }) {
-            self.snapshot.status = StrategyRunStatus::Cancelled;
+            // Cancellation is final only when no position stays in doubt.
+            self.snapshot.status = if self
+                .snapshot
+                .commands
+                .values()
+                .any(|command| command.status == CommandStatus::InDoubt)
+            {
+                self.snapshot.diagnostic_code = Some("cancellation_outcome_unknown".into());
+                StrategyRunStatus::CancelInDoubt
+            } else {
+                StrategyRunStatus::Cancelled
+            };
         }
         Ok(())
     }

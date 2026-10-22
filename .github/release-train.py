@@ -225,7 +225,11 @@ def cmd_candidate(args: argparse.Namespace) -> int:
     nightly = git_ok("rev-parse", "--verify", "-q", "refs/remotes/origin/nightly")
     if kind == "train" and mode == "live" and not nightly:
         raise TrainError("a live train needs the `nightly` branch")
-    branch = "nightly" if nightly else args.default_branch
+    # The publish gate binds the candidate to the default-branch run head,
+    # so selection must live on that same branch: a `nightly` side line
+    # would pick candidates the gate is bound to reject. A repository that
+    # releases from `nightly` makes it the default branch.
+    branch = args.default_branch
     cutoff = ""
     if args.override:
         if not SAFE_REF.fullmatch(args.override):

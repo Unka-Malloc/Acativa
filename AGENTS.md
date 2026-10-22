@@ -2,21 +2,24 @@
 
 ## Environment fidelity (hard rule)
 
-Agent infrastructure never launches an agent with an empty or minimal
-"no variables" environment — the user's machine is the source of
-truth. Presets, cards and specs declare how every needed value is
-*resolved* from the real environment: host environment variables
-(PATH and friends), values inside configuration files (TOML, YAML or
-JSON — read by key lookup, never copied by hand), and every model or
-provider the agent can use. The custody layer resolves those
-declarations into concrete values before spawn; the child receives
-the user's real environment plus explicit overrides.
+Host-environment fidelity is an explicit grant, never a default. The
+engine's default for every launched agent is a sanitized environment:
+presets, cards and specs declare how each needed value is *resolved*
+from the user's real environment — host environment variables (PATH
+and friends), values inside configuration files (TOML, YAML or JSON —
+read by key lookup, never copied by hand), and the declared models or
+providers — and a value crosses a remote boundary only as a resolved
+literal, never as a reference.
 
-An agent started "clean" loses the user's configuration, credentials,
-providers and tools — that is a defect, not hardening. Security lives
-in *where* values resolve (locally, at the custody boundary) and
-*what* may cross a remote boundary (literal values, not references) —
-never in running with no environment at all.
+When the host makes its own explicit opt-in to host-environment
+fidelity, the custody layer resolves the declared values locally and
+the child receives the user's real environment plus explicit
+overrides. A fidelity launch that silently drops the user's
+configuration, credentials, providers and tools is a defect — but so
+is an agent that inherits ambient credentials without that grant.
+Security lives in *where* values resolve (locally, at the custody
+boundary) and *what* may cross a remote boundary, and in fidelity
+being a deliberate grant.
 
 ## Verify
 

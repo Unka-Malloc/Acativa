@@ -61,10 +61,40 @@ jobs:
           github-token: ${{ github.token }}
           path: release-inputs
 
-      # The inputs file is KEY=VALUE pairs written by the verify job's own
-      # step outputs; it is data, never code, so sourcing it is safe.
+      # The inputs file crossed out of a runner that executed candidate
+      # code — its fields must be validated as data before they can drive
+      # the OIDC job. Every key is matched against a strict shape; anything
+      # else fails the gate instead of reaching a shell expansion later.
       - id: load
-        run: cat release-inputs/env >> "$GITHUB_OUTPUT"
+        run: |
+          python3 - <<'PY'
+          import re, os, sys
+          SHAPES = {
+              "sha": r"[0-9a-f]{40}",
+              "branch": r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}",
+              "kind": r"(train|manual)",
+              "mode": r"(dry-run|live)",
+              "release": r"(true|false)",
+              "needs_set": r"(true|false)",
+              "next": r"[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?",
+              "excludes": r"([A-Za-z0-9_-]+( [A-Za-z0-9_-]+)*)?",
+          }
+          fields = {}
+          for line in open("release-inputs/env"):
+              key, _, value = line.strip().partition("=")
+              if not key:
+                  continue
+              shape = SHAPES.get(key)
+              if shape is None or not re.fullmatch(shape, value):
+                  raise SystemExit(f"release input fails shape check: {key}={value!r}")
+              fields[key] = value
+          missing = [k for k in SHAPES if k not in fields]
+          if missing:
+              raise SystemExit(f"release inputs missing keys: {', '.join(missing)}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              for key, value in fields.items():
+                  out.write(f"{key}={value}\n")
+          PY
 
       # A run is bound only when it executed this repository's real
       # verify.yml file (a same-named workflow file elsewhere does not
@@ -134,7 +164,6 @@ jobs:
     permissions:
       contents: write
       pull-requests: read
-      actions: read
       id-token: write
     env:
       RELEASE_MODE: live
@@ -149,28 +178,57 @@ jobs:
         shell: bash
         working-directory: Acativa
     steps:
-      # Git refs move inside this job, so the candidate is checked out; no
-      # candidate-controlled code runs here — publishing replays the verified
-      # artifacts produced by the verify train.
+      # Git refs move inside this job, so the candidate is checked out — but
+      # nothing the verify runner produced crosses this boundary. The bump,
+      # the publish order and the .crate set are all recreated here from the
+      # bound commit by trusted workflow steps that never compile or execute
+      # candidate build scripts, tests or hooks.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           path: Acativa
           ref: ${{ needs.gate.outputs.sha }}
           fetch-depth: 0
 
-      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
-        with:
-          name: release-set-${{ needs.gate.outputs.sha }}
-          path: release-set
-          run-id: ${{ needs.gate.outputs.run_id }}
-          github-token: ${{ github.token }}
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
-      # The version bump was authored under the read-only token; here it is
-      # only a patch the release job replays onto the candidate tree.
+      - name: Install the pinned toolchain
+        run: |
+          if [ -f rust-toolchain.toml ] || [ -f rust-toolchain ]; then
+            rustup toolchain install
+          fi
+
+      # The bump the verify train decided is recreated here from `next`:
+      # a manifest rewrite driven by cargo metadata — data only, nothing
+      # compiles and no candidate script runs under the OIDC token.
       - name: Commit the release version
         if: env.NEEDS_SET == 'true'
         run: |
-          git apply "$GITHUB_WORKSPACE/release-set/version-bump.patch"
+          python3 - <<'PY'
+          import json, os, re, subprocess
+          next_v = os.environ["NEXT"]
+          meta = json.loads(subprocess.run(
+              ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+              capture_output=True, text=True, check=True).stdout)
+          members = set(meta["workspace_members"])
+          packages = {p["name"]: p for p in meta["packages"] if p["id"] in members}
+          old = {p["version"] for p in packages.values()}
+          VERSION = re.compile(r'version\s*=\s*"([^"]*)"')
+          for package in packages.values():
+              path = package["manifest_path"]
+              out, in_package, bumped = [], False, False
+              for line in open(path):
+                  stripped = line.strip()
+                  if stripped.startswith("["):
+                      in_package = stripped == "[package]"
+                  match = VERSION.search(line)
+                  if match and match.group(1) in old and (
+                          in_package and not bumped or "path" in line):
+                      line = line[:match.start(1)] + next_v + line[match.end(1):]
+                      bumped |= in_package
+                  out.append(line)
+              open(path, "w").writelines(out)
+          PY
+          cargo update --workspace
           git -c user.name="github-actions[bot]" \
             -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
             commit -qam "release: v$NEXT"
@@ -185,14 +243,49 @@ jobs:
         id: auth
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
 
+      # Dependency-first publish order is recomputed from cargo metadata —
+      # manifest data, not executed code — so the ordering matches the tree
+      # this job checked out and just bumped.
+      - name: Rebuild the release set
+        run: |
+          mkdir -p target/package
+          python3 - <<'PY' > target/package/publish-order.txt
+          import json, os, subprocess
+          meta = json.loads(subprocess.run(
+              ["cargo", "metadata", "--format-version", "1"],
+              capture_output=True, text=True, check=True).stdout)
+          members = set(meta["workspace_members"])
+          packages = {p["name"]: p for p in meta["packages"] if p["id"] in members}
+          publishable = {n: p for n, p in packages.items()
+                         if p["publish"] is None or "crates-io" in p["publish"]}
+          excludes = set((os.environ.get("EXCLUDES") or "").split())
+          pending = dict.fromkeys(sorted(set(publishable) - excludes))
+          ordered = []
+          while pending:
+              ready = [n for n in pending
+                       if not any(d["name"] in pending
+                                  for d in publishable[n]["dependencies"]
+                                  if d["kind"] != "dev")]
+              if not ready:
+                  raise SystemExit(f"dependency cycle among {', '.join(sorted(pending))}")
+              ordered.extend(sorted(ready))
+              for n in ready:
+                  del pending[n]
+          for n in ordered:
+              print(f"{n}\t{publishable[n]['version']}")
+          PY
+          args=()
+          for crate in $EXCLUDES; do args+=(--exclude "$crate"); done
+          cargo package --workspace --allow-dirty --no-verify "${args[@]}"
+
       # The whole upload loop lives in this workflow — the only file the OIDC
-      # trust is bound to. Nothing from the candidate checkout executes here:
-      # the .crate payloads are data, tar extracts them, and `cargo publish
-      # --no-verify` packages files without compiling or running build scripts.
-      - name: Publish the verified release set to crates.io
+      # trust is bound to. The .crate set was packaged locally from the bound
+      # commit; tar extracts payloads as data, and `cargo publish --no-verify`
+      # uploads them without compiling or running build scripts.
+      - name: Publish the release set to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-          SET: ${{ github.workspace }}/release-set
+          SET: target/package
         run: |
           index_path() {
             case ${#1} in

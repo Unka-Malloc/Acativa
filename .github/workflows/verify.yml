@@ -136,8 +136,9 @@ jobs:
         if: steps.version.outputs.release == 'true'
         run: |
           cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace --all-targets
-      # The bump is applied here under the read-only token and shipped to the
-      # release job as a patch — the OIDC job only ever runs `git apply`.
+      # The bump is applied here only so the dry-run validates the exact
+      # release versions; the OIDC job recreates it from the bound commit —
+      # nothing a verify-runner produced crosses the OIDC boundary.
       - name: Apply the release version
         if: steps.version.outputs.release == 'true' && steps.version.outputs.needs_set == 'true'
         env:
@@ -146,14 +147,11 @@ jobs:
           cargo install cargo-edit@0.13.13 --locked --no-default-features --features set-version
           cargo set-version --workspace "$NEXT"
           cargo update --workspace
-          # The patch must carry only the bump: scope the diff to manifests
-          # so anything else verify left in the tree cannot ride into the
-          # release job's `git apply`.
-          git diff -- ':(glob)**/Cargo.toml' ':(glob)**/Cargo.lock' \
-            > "$RUNNER_TEMP/version-bump.patch"
 
-      # Everything publishable lands in target/package/ plus an ordered list the
-      # release job replays; packaging collects files and never runs code.
+      # Dry-run validation only. No artifacts ship to the OIDC job: it
+      # repackages the bound commit itself with `cargo package --no-verify`,
+      # which collects manifest-declared files without compiling or running
+      # build scripts.
       - name: Package
         if: steps.version.outputs.release == 'true'
         env:
@@ -162,10 +160,6 @@ jobs:
           args=()
           for crate in $EXCLUDES; do args+=(--exclude "$crate"); done
           cargo publish --workspace --dry-run --allow-dirty "${args[@]}"
-          cargo package --workspace --allow-dirty --no-verify "${args[@]}"
-          python3 "$RUNNER_TEMP/train.py" order > target/package/publish-order.txt
-          [ -f "$RUNNER_TEMP/version-bump.patch" ] &&
-            cp "$RUNNER_TEMP/version-bump.patch" target/package/
 
       # The release train (default branch) reads this data-only file to
       # learn the candidate, the version decision and the kind of run; it
@@ -192,13 +186,4 @@ jobs:
           name: release-inputs
           path: Acativa/target/release-inputs/
           retention-days: 7
-          if-no-files-found: error
-
-      - name: Hand the release set to the release job
-        if: steps.version.outputs.release == 'true'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: release-set-${{ steps.candidate.outputs.sha }}
-          path: Acativa/target/package/
-          retention-days: 5
           if-no-files-found: error

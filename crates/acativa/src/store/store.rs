@@ -66,10 +66,28 @@ impl StoreDialect {
     }
 }
 
+/// Removes an in-memory store's private scratch directory once the last
+/// handle drops. Each clone shares the guard, so the directory outlives every
+/// connection and is reclaimed when the store itself is gone.
+#[derive(Debug)]
+struct ScratchDir {
+    path: PathBuf,
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct StrategyStore {
     db_path: PathBuf,
     dialect: StoreDialect,
+    /// Held only for its `Drop`: the private scratch directory of an
+    /// in-memory store is removed when the last handle goes away.
+    #[allow(dead_code)]
+    scratch_dir: Option<std::sync::Arc<ScratchDir>>,
 }
 
 impl StrategyStore {
@@ -89,6 +107,7 @@ impl StrategyStore {
         let store = Self {
             db_path,
             dialect: dialect.clone(),
+            scratch_dir: None,
         };
         store.with_connection(|connection| {
             if existed {
@@ -108,14 +127,21 @@ impl StrategyStore {
     }
 
     /// An in-memory store under an explicit dialect.
+    ///
+    /// The database lives in a private scratch directory that only this user
+    /// can read and that is removed when the last store handle drops; a file
+    /// name in the shared temp root would be readable by other processes and
+    /// would linger after use.
     pub fn open_in_memory_as(dialect: &StoreDialect) -> Result<Self> {
-        let path =
-            std::env::temp_dir().join(format!("acativa-strategy-{}.sqlite3", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("acativa-memory-{}", Uuid::new_v4()));
+        file_security::ensure_private_dir(&root)?;
         let store = Self {
-            db_path: path,
+            db_path: root.join(DATABASE_FILE),
             dialect: dialect.clone(),
+            scratch_dir: Some(std::sync::Arc::new(ScratchDir { path: root })),
         };
         store.with_connection(initialize_schema)?;
+        file_security::harden_private_path(&store.db_path)?;
         Ok(store)
     }
 
@@ -861,7 +887,27 @@ impl StrategyStore {
     pub fn apply_event(&self, run_id: &str, event: ReducerEvent) -> Result<RunSnapshot> {
         let committed = self.apply_event_with_commit(run_id, event)?;
         match committed {
-            Some(committed) => Ok(committed.after),
+            Some((_, after)) => Ok(after),
+            None => self.run(run_id),
+        }
+    }
+
+    /// Apply a command lifecycle event on behalf of the claim's recorded
+    /// owner. Ownership is compared against the persisted lease inside the
+    /// same transaction that commits the transition: a settlement carrying a
+    /// valid attempt token still fails when the live lease names another
+    /// claimant. Events for commands that hold no live lease (pending work
+    /// that was never claimed, or an expired claim) settle through the plain
+    /// [`Self::apply_event`] path exactly like before.
+    pub fn apply_owned_event(
+        &self,
+        run_id: &str,
+        claimant: &str,
+        event: ReducerEvent,
+    ) -> Result<RunSnapshot> {
+        let committed = self.apply_event_inner(run_id, event, Some(claimant))?;
+        match committed {
+            Some((_, after)) => Ok(after),
             None => self.run(run_id),
         }
     }
@@ -870,10 +916,23 @@ impl StrategyStore {
         &self,
         run_id: &str,
         event: ReducerEvent,
-    ) -> Result<Option<super::CommittedTransition>> {
+    ) -> Result<Option<(super::CommittedTransition, RunSnapshot)>> {
+        self.apply_event_inner(run_id, event, None)
+    }
+
+    pub(crate) fn apply_event_inner(
+        &self,
+        run_id: &str,
+        event: ReducerEvent,
+        claimant: Option<&str>,
+    ) -> Result<Option<(super::CommittedTransition, RunSnapshot)>> {
+        if let Some(claimant) = claimant {
+            validate_opaque_id(claimant, "strategy_claimant_invalid")?;
+        }
         self.with_connection(|connection| {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            authenticate_command_event(&transaction, run_id, &event, claimant)?;
             let previous = load_run(&transaction, run_id)?;
             let workflow = workflow_for_revision(&transaction, &previous.definition_digest)?;
             let compiled = compile_workflow(workflow, &self.dialect.workflow_schema)?;
@@ -902,14 +961,16 @@ impl StrategyStore {
             }
             transaction.commit()?;
             if output.applied {
-                Ok(Some(super::CommittedTransition {
+                let after = output.snapshot;
+                let intent = super::CommittedTransition {
                     run_id: run_id.to_owned(),
-                    sequence: output.snapshot.sequence,
+                    sequence: after.sequence,
                     event,
-                    before: previous,
-                    after: output.snapshot,
+                    before: transition_delta(&previous, &after),
+                    after: transition_delta(&after, &previous),
                     created_at_unix_ms: now_ms(),
-                }))
+                };
+                Ok(Some((intent, after)))
             } else {
                 Ok(None)
             }
@@ -1125,44 +1186,26 @@ impl StrategyStore {
     /// retried against the same attempt identity, while a claim whose effect was
     /// already in flight stays in doubt and is never blindly repeated.
     pub fn recover_next_expired_command(&self, run_id: &str) -> Result<bool> {
-        let Some(command_id) = self.next_expired_leased_command_id(run_id)? else {
-            return Ok(false);
-        };
-        self.recover_leased_command(run_id, &command_id)?;
-        Ok(true)
-    }
-
-    fn next_expired_leased_command_id(&self, run_id: &str) -> Result<Option<String>> {
         self.with_connection(|connection| {
-            connection
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // Selection and transition run under the same write lock: a lease
+            // renewal that commits first makes the claim unexpired and it is
+            // never selected, so a renewed claim cannot be retried or marked
+            // in-doubt behind its owner's back.
+            let value: Option<(String, String)> = transaction
                 .query_row(
-                    "SELECT command_id FROM strategy_commands
+                    "SELECT command_json, status FROM strategy_commands
                      WHERE run_id=?1 AND status IN ('claimed', 'running')
                        AND lease_until IS NOT NULL AND lease_until<=?2
                      ORDER BY command_id ASC LIMIT 1",
                     params![run_id, now_ms()],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(Into::into)
-        })
-    }
-
-    fn recover_leased_command(&self, run_id: &str, command_id: &str) -> Result<()> {
-        self.with_connection(|connection| {
-            let transaction =
-                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let value: Option<(String, String)> = transaction
-                .query_row(
-                    "SELECT command_json, status FROM strategy_commands
-                     WHERE run_id=?1 AND command_id=?2 AND status IN ('claimed', 'running')",
-                    params![run_id, command_id],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
             let Some((command_json, persisted_status)) = value else {
                 transaction.commit()?;
-                return Ok(());
+                return Ok(false);
             };
             let command: RunCommand = serde_json::from_str(&command_json)?;
             let expected_status = enum_wire(command.status)?;
@@ -1243,7 +1286,7 @@ impl StrategyStore {
                 params![&command.id],
             )?;
             transaction.commit()?;
-            Ok(())
+            Ok(true)
         })
     }
 
@@ -1910,7 +1953,16 @@ fn persist_event_and_commands(
             ],
         )?;
     }
-    for command in snapshot.commands.values() {
+    // Only the commands this event touched are rewritten; updating every
+    // accumulated row per event would turn a long run's persistence quadratic.
+    let emitted_ids = emitted
+        .iter()
+        .map(|command| command.id.as_str())
+        .collect::<BTreeSet<_>>();
+    for command in snapshot.commands.values().filter(|command| {
+        !emitted_ids.contains(command.id.as_str())
+            && before.commands.get(&command.id) != Some(command)
+    }) {
         transaction.execute(
             "UPDATE strategy_commands SET status=?2, command_json=?3, updated_at=?4
              WHERE command_id=?1",
@@ -1923,6 +1975,91 @@ fn persist_event_and_commands(
         )?;
     }
     Ok(())
+}
+
+/// Authenticate a command lifecycle event against the persisted lease inside
+/// the committing transaction.
+///
+/// The attempt token alone is not authority: a caller that learned one (logs,
+/// an older lease, a replayed message) could otherwise settle a command it
+/// does not own. While a claim's lease is live the persisted `lease_owner`
+/// must equal the presented claimant; an expired or absent lease admits the
+/// event on the token the reducer still checks. `CommandClaimed` is refused
+/// outright here because a claim is only durable through the lease-writing
+/// [`StrategyStore::claim_next_command`] path.
+fn authenticate_command_event(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+    event: &ReducerEvent,
+    claimant: Option<&str>,
+) -> Result<()> {
+    let (command_id, attempt_token) = match event {
+        ReducerEvent::CommandClaimed { .. } => {
+            return Err(anyhow!("strategy_claim_requires_lease"));
+        }
+        ReducerEvent::CommandStarted {
+            command_id,
+            attempt_token,
+        }
+        | ReducerEvent::CommandSucceeded {
+            command_id,
+            attempt_token,
+            ..
+        }
+        | ReducerEvent::CommandFailed {
+            command_id,
+            attempt_token,
+            ..
+        }
+        | ReducerEvent::CancellationAcknowledged {
+            command_id,
+            attempt_token,
+        }
+        | ReducerEvent::CancellationUnknown {
+            command_id,
+            attempt_token,
+        } => (command_id, Some(attempt_token.as_str())),
+        ReducerEvent::RetryRequested { command_id } => (command_id, None),
+        _ => return Ok(()),
+    };
+    let lease: Option<(String, Option<String>, Option<i64>)> = transaction
+        .query_row(
+            "SELECT attempt_token, lease_owner, lease_until FROM strategy_commands
+             WHERE command_id=?1 AND run_id=?2",
+            params![command_id, run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((persisted_token, owner, lease_until)) = lease else {
+        // A command row the event names but the store never recorded is the
+        // reducer's problem: it reports the stale callback itself.
+        return Ok(());
+    };
+    if let Some(token) = attempt_token {
+        ensure!(persisted_token == token, "strategy_callback_stale");
+    }
+    if let (Some(owner), Some(until)) = (owner, lease_until)
+        && until > now_ms()
+    {
+        ensure!(claimant == Some(owner.as_str()), "strategy_lease_lost");
+    }
+    Ok(())
+}
+
+/// The observer-facing half of a committed transition: the full run-level
+/// state of `snapshot`, but only the commands whose record differs in
+/// `other`. Persisting and dispatching this delta keeps each transition's
+/// cost proportional to the work it changed, not to the whole accumulated
+/// ledger.
+pub(crate) fn transition_delta(snapshot: &RunSnapshot, other: &RunSnapshot) -> RunSnapshot {
+    let mut delta = snapshot.clone();
+    delta.commands = snapshot
+        .commands
+        .iter()
+        .filter(|(id, command)| other.commands.get(*id) != Some(command))
+        .map(|(id, command)| (id.clone(), command.clone()))
+        .collect();
+    delta
 }
 
 fn enum_wire(value: impl serde::Serialize) -> Result<String> {
@@ -2209,8 +2346,9 @@ mod tests {
             .unwrap()
             .unwrap();
         store
-            .apply_event(
+            .apply_owned_event(
                 &run.run_id,
+                "claimant",
                 ReducerEvent::CommandStarted {
                     command_id: command.id.clone(),
                     attempt_token: command.attempt_token.clone(),
@@ -2382,8 +2520,9 @@ mod tests {
             .unwrap()
             .unwrap();
         store
-            .apply_event(
+            .apply_owned_event(
                 &run.run_id,
+                "claimant",
                 ReducerEvent::CommandStarted {
                     command_id: claimed.id.clone(),
                     attempt_token: claimed.attempt_token.clone(),
@@ -2441,8 +2580,9 @@ mod tests {
             .unwrap()
             .unwrap();
         store
-            .apply_event(
+            .apply_owned_event(
                 &run.run_id,
+                "claimant",
                 ReducerEvent::CommandStarted {
                     command_id: claimed.id.clone(),
                     attempt_token: claimed.attempt_token.clone(),
@@ -2491,8 +2631,9 @@ mod tests {
             .unwrap()
             .unwrap();
         store
-            .apply_event(
+            .apply_owned_event(
                 &run.run_id,
+                "claimant",
                 ReducerEvent::CommandStarted {
                     command_id: claimed.id.clone(),
                     attempt_token: claimed.attempt_token.clone(),
@@ -2503,8 +2644,9 @@ mod tests {
         // The owner settles its own attempt; nothing else may report on it.
         assert!(
             store
-                .apply_event(
+                .apply_owned_event(
                     &run.run_id,
+                    "claimant",
                     ReducerEvent::CommandSucceeded {
                         command_id: claimed.id.clone(),
                         attempt_token: "attempt:someone-else".into(),
@@ -2554,5 +2696,127 @@ mod tests {
             .unwrap();
         let bound = store.run(&run.run_id).unwrap();
         assert_eq!(bound.context_id.as_deref(), Some("context:group"));
+    }
+
+    /// Recovery selects and transitions the expired claim inside one
+    /// immediate transaction, so a lease renewal that committed first is
+    /// observed under the same write lock and the claim is never retried or
+    /// marked in-doubt behind its owner's back.
+    #[test]
+    fn a_renewed_claim_is_never_recovered() {
+        let store = StrategyStore::open_in_memory().unwrap();
+        let revision = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        store
+            .register_definition(revision, revision, &workflow(), 1, 1)
+            .unwrap();
+        store
+            .update_binding(revision, "worker", "agent:test", "", "", None)
+            .unwrap();
+        let preview = store.authorization_preview(revision).unwrap();
+        store
+            .grant_authorization(revision, &preview.authorization_digest)
+            .unwrap();
+        let run = store
+            .start_run(revision, json!({}), "renewal-fence", None, None)
+            .unwrap();
+        let claimed = store
+            .claim_next_command(&run.run_id, "claimant", now_ms() + 60_000)
+            .unwrap()
+            .unwrap();
+        store
+            .apply_owned_event(
+                &run.run_id,
+                "claimant",
+                ReducerEvent::CommandStarted {
+                    command_id: claimed.id.clone(),
+                    attempt_token: claimed.attempt_token.clone(),
+                },
+            )
+            .unwrap();
+        store
+            .renew_command_lease(&claimed.id, "claimant", now_ms() + 120_000)
+            .unwrap();
+        assert!(!store.recover_next_expired_command(&run.run_id).unwrap());
+        let held = store.run(&run.run_id).unwrap();
+        assert_eq!(held.commands[&claimed.id].status, CommandStatus::Running);
+    }
+
+    /// A command whose effect outcome is unknowable cannot be cancelled into
+    /// a clean `Cancelled` report: the run stays `CancelInDoubt` until every
+    /// position is resolved.
+    #[test]
+    fn an_in_doubt_position_holds_cancellation_open() {
+        let store = StrategyStore::open_in_memory().unwrap();
+        let revision = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        store
+            .register_definition(revision, revision, &workflow(), 1, 1)
+            .unwrap();
+        store
+            .update_binding(revision, "worker", "agent:test", "", "", None)
+            .unwrap();
+        let preview = store.authorization_preview(revision).unwrap();
+        store
+            .grant_authorization(revision, &preview.authorization_digest)
+            .unwrap();
+        let run = store
+            .start_run(revision, json!({}), "cancel-in-doubt-single", None, None)
+            .unwrap();
+        let claimed = store
+            .claim_next_command(&run.run_id, "claimant", now_ms() + 60_000)
+            .unwrap()
+            .unwrap();
+        store
+            .apply_owned_event(
+                &run.run_id,
+                "claimant",
+                ReducerEvent::CommandStarted {
+                    command_id: claimed.id.clone(),
+                    attempt_token: claimed.attempt_token.clone(),
+                },
+            )
+            .unwrap();
+        store
+            .apply_event(&run.run_id, ReducerEvent::CancelRequested)
+            .unwrap();
+        store
+            .apply_owned_event(
+                &run.run_id,
+                "claimant",
+                ReducerEvent::CancellationUnknown {
+                    command_id: claimed.id.clone(),
+                    attempt_token: claimed.attempt_token.clone(),
+                },
+            )
+            .unwrap();
+        // A second cancel request re-evaluates; the in-doubt position keeps
+        // the run open instead of being reported cancelled.
+        store
+            .apply_event(&run.run_id, ReducerEvent::CancelRequested)
+            .unwrap();
+        let snapshot = store.run(&run.run_id).unwrap();
+        assert_eq!(snapshot.status, StrategyRunStatus::CancelInDoubt);
+        assert_eq!(
+            snapshot.commands[&claimed.id].status,
+            CommandStatus::InDoubt
+        );
+    }
+
+    /// The in-memory store's scratch file lives in a directory only this user
+    /// can read and disappears with the last handle.
+    #[test]
+    fn in_memory_store_scratch_dir_is_private_and_removed() {
+        let store = StrategyStore::open_in_memory().unwrap();
+        let dir = store.db_path().parent().unwrap().to_owned();
+        assert!(store.db_path().exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        drop(store);
+        assert!(!dir.exists(), "scratch directory removed with the store");
     }
 }

@@ -265,8 +265,9 @@ fn the_dispatch_gate_admits_exactly_the_authority_the_store_committed() {
     let claimed = fixture.claim("first-owner");
     fixture
         .store
-        .apply_event(
+        .apply_owned_event(
             &fixture.run_id,
+            "first-owner",
             ReducerEvent::CommandStarted {
                 command_id: claimed.id.clone(),
                 attempt_token: claimed.attempt_token.clone(),
@@ -354,8 +355,9 @@ fn an_expired_in_flight_claim_stays_in_doubt_and_is_never_repeated() {
     let claimed = fixture.claim("first-owner");
     fixture
         .store
-        .apply_event(
+        .apply_owned_event(
             &fixture.run_id,
+            "first-owner",
             ReducerEvent::CommandStarted {
                 command_id: claimed.id.clone(),
                 attempt_token: claimed.attempt_token.clone(),
@@ -412,8 +414,9 @@ fn a_foreign_or_repeated_owner_result_cannot_settle_the_attempt() {
     let claimed = fixture.claim("first-owner");
     fixture
         .store
-        .apply_event(
+        .apply_owned_event(
             &fixture.run_id,
+            "first-owner",
             ReducerEvent::CommandStarted {
                 command_id: claimed.id.clone(),
                 attempt_token: claimed.attempt_token.clone(),
@@ -427,8 +430,9 @@ fn a_foreign_or_repeated_owner_result_cannot_settle_the_attempt() {
     assert!(
         fixture
             .store
-            .apply_event(
+            .apply_owned_event(
                 &fixture.run_id,
+                "first-owner",
                 ReducerEvent::CommandSucceeded {
                     command_id: claimed.id.clone(),
                     attempt_token: "attempt:someone-else".into(),
@@ -436,7 +440,38 @@ fn a_foreign_or_repeated_owner_result_cannot_settle_the_attempt() {
                 },
             )
             .is_err(),
-        "a stale owner cannot settle an attempt it does not own"
+        "a stale token cannot settle an attempt even for the recorded owner"
+    );
+    // And a caller that is not the lease owner is refused outright, valid
+    // token or not — settlement proves ownership, not just token knowledge.
+    assert!(
+        fixture
+            .store
+            .apply_owned_event(
+                &fixture.run_id,
+                "someone-else",
+                ReducerEvent::CommandSucceeded {
+                    command_id: claimed.id.clone(),
+                    attempt_token: claimed.attempt_token.clone(),
+                    output: json!({ "ok": true }),
+                },
+            )
+            .is_err(),
+        "a foreign claimant cannot settle the owner's attempt"
+    );
+    assert!(
+        fixture
+            .store
+            .apply_event(
+                &fixture.run_id,
+                ReducerEvent::CommandSucceeded {
+                    command_id: claimed.id.clone(),
+                    attempt_token: claimed.attempt_token.clone(),
+                    output: json!({ "ok": true }),
+                },
+            )
+            .is_err(),
+        "an unauthenticated caller cannot settle a leased attempt"
     );
     let foreign = EffectCompletion {
         command_id: claimed.id.clone(),
@@ -452,8 +487,9 @@ fn a_foreign_or_repeated_owner_result_cannot_settle_the_attempt() {
     // The recorded owner settles once.
     fixture
         .store
-        .apply_event(
+        .apply_owned_event(
             &fixture.run_id,
+            "first-owner",
             ReducerEvent::CommandSucceeded {
                 command_id: claimed.id.clone(),
                 attempt_token: claimed.attempt_token.clone(),
@@ -492,8 +528,9 @@ fn a_foreign_or_repeated_owner_result_cannot_settle_the_attempt() {
     );
 
     // Re-reporting at the store leaves the settled attempt exactly as it was.
-    let _ = fixture.store.apply_event(
+    let _ = fixture.store.apply_owned_event(
         &fixture.run_id,
+        "first-owner",
         ReducerEvent::CommandSucceeded {
             command_id: claimed.id.clone(),
             attempt_token: claimed.attempt_token.clone(),
@@ -514,8 +551,9 @@ fn a_stop_refuses_new_dispatch_and_leaves_the_in_flight_attempt_unresolved() {
     let claimed = fixture.claim("first-owner");
     fixture
         .store
-        .apply_event(
+        .apply_owned_event(
             &fixture.run_id,
+            "first-owner",
             ReducerEvent::CommandStarted {
                 command_id: claimed.id.clone(),
                 attempt_token: claimed.attempt_token.clone(),

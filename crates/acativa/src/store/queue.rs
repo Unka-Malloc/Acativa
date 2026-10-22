@@ -215,7 +215,7 @@ impl DurableQueue {
             .with_connection_typed(|connection| -> std::result::Result<(), QueueStoreError> {
                 let changed = connection
                     .execute(
-                        "UPDATE workflow_queue SET status='completed', claimant=NULL, lease_until=NULL
+                        "DELETE FROM workflow_queue
                          WHERE cursor=?1 AND status='claimed' AND claimant=?2",
                         params![cursor as i64, claimant],
                     )
@@ -290,8 +290,12 @@ impl DurableQueue {
                     [],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )?;
+            // AUTOINCREMENT's high-water mark, not MAX(cursor): acknowledged
+            // rows are deleted, so the surviving rows no longer bound the
+            // next cursor.
             let next_cursor: i64 = connection.query_row(
-                "SELECT COALESCE(MAX(cursor), 0) + 1 FROM workflow_queue",
+                "SELECT COALESCE(
+                   (SELECT seq FROM sqlite_sequence WHERE name='workflow_queue'), 0) + 1",
                 [],
                 |row| row.get(0),
             )?;
@@ -541,10 +545,10 @@ mod tests {
             .acknowledge(recovered.item.cursor, "worker-b")
             .unwrap();
 
+        // Acknowledged items are deleted, not archived: replay surfaces only
+        // what still needs delivery, and the durable history stays bounded.
         let replay = queue.replay_from_cursor(0).unwrap();
-        assert_eq!(replay.len(), 2);
-        assert_eq!(replay[0].item_id, "control-1");
-        assert_eq!(replay[1].item_id, "data-1");
+        assert!(replay.is_empty());
         let stats = queue.stats().unwrap();
         assert_eq!(stats.pending_control, 0);
         assert_eq!(stats.pending_data, 0);

@@ -467,44 +467,100 @@ impl Display for AdmissionConflict {
 
 impl std::error::Error for AdmissionConflict {}
 
+/// Every storage-layer failure maps to `Storage`: an admission decided on a
+/// failed read would be a fail-open gate.
+impl From<anyhow::Error> for AdmissionConflict {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Storage {
+            reason: error.to_string(),
+        }
+    }
+}
+
+impl From<rusqlite::Error> for AdmissionConflict {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Storage {
+            reason: error.to_string(),
+        }
+    }
+}
+
+impl From<serde_json::Error> for AdmissionConflict {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Storage {
+            reason: error.to_string(),
+        }
+    }
+}
+
 /// Port/contract for the controlled store managing graph state, revisions, and admission log.
+///
+/// Every read fails closed: a lookup error is `Err(Storage)`, never a quiet
+/// "not revoked" or "not stopped" answer.
 pub trait ControlledStore: Send + Sync {
     /// Return the current graph definition revision if the graph exists.
-    fn get_graph_revision(&self, graph_id: &str) -> Option<u64>;
+    fn get_graph_revision(&self, graph_id: &str) -> Result<Option<u64>, AdmissionConflict>;
 
     /// Return the current control revision for the specified node.
-    fn get_node_control_revision(&self, graph_id: &str, node_id: &str) -> Option<u64>;
+    fn get_node_control_revision(
+        &self,
+        graph_id: &str,
+        node_id: &str,
+    ) -> Result<Option<u64>, AdmissionConflict>;
 
     /// Check if the invocation has already completed/settled.
-    fn is_invocation_settled(&self, graph_id: &str, node_id: &str, invocation_id: &str) -> bool;
+    fn is_invocation_settled(
+        &self,
+        graph_id: &str,
+        node_id: &str,
+        invocation_id: &str,
+    ) -> Result<bool, AdmissionConflict>;
 
     /// Check if stop has already been requested for this target (node or graph).
-    fn is_stop_requested(&self, graph_id: &str, target: &str) -> bool;
+    fn is_stop_requested(&self, graph_id: &str, target: &str) -> Result<bool, AdmissionConflict>;
 
     /// Check if pause is currently being negotiated for this target.
-    fn is_pause_negotiating(&self, graph_id: &str, target: &str) -> bool;
+    fn is_pause_negotiating(&self, graph_id: &str, target: &str)
+    -> Result<bool, AdmissionConflict>;
 
     /// Check if a graph-scope admission barrier is currently active.
-    fn is_graph_barrier_active(&self, graph_id: &str) -> bool;
+    fn is_graph_barrier_active(&self, graph_id: &str) -> Result<bool, AdmissionConflict>;
 
     /// Return the target's current lifecycle generation.
-    fn get_target_generation(&self, graph_id: &str, target: &str) -> Option<u64>;
+    fn get_target_generation(
+        &self,
+        graph_id: &str,
+        target: &str,
+    ) -> Result<Option<u64>, AdmissionConflict>;
 
     /// Check if a grant has been dynamically revoked for this principal.
-    fn is_grant_revoked(&self, principal_id: &str, grant: &OperationGrant) -> bool;
+    fn is_grant_revoked(
+        &self,
+        principal_id: &str,
+        grant: &OperationGrant,
+    ) -> Result<bool, AdmissionConflict>;
 
     /// Look up an idempotency record by request_id.
-    fn find_idempotency_record(&self, request_id: &str) -> Option<(AdmissionReceipt, String)>;
+    fn find_idempotency_record(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<(AdmissionReceipt, String)>, AdmissionConflict>;
 
     /// Durably commit an admitted command to the queue.
     ///
-    /// The store assigns the monotonically increasing admission sequence on the
-    /// receipt, persists the admitted control revision of the target node, and
-    /// records the stop/pause negotiation facts implied by the operation.
+    /// The store assigns the monotonically increasing admission sequence on
+    /// the receipt, persists the admitted control revision of the target
+    /// node, and records the stop/pause negotiation facts implied by the
+    /// operation. `expected_control_revision` is verified against the
+    /// persisted revision inside the committing transaction, so competing
+    /// exclusive controls that read the same revision cannot both be
+    /// admitted; the committed revision the store assigned lands on
+    /// `receipt.control_revision`.
     fn record_admission(
         &mut self,
         receipt: &mut AdmissionReceipt,
         payload_digest: String,
+        expected_control_revision: Option<u64>,
     ) -> Result<(), AdmissionConflict>;
 }
 
@@ -599,67 +655,115 @@ impl InMemoryControlledStore {
 }
 
 impl ControlledStore for InMemoryControlledStore {
-    fn get_graph_revision(&self, graph_id: &str) -> Option<u64> {
-        self.graph_revisions.get(graph_id).copied()
+    fn get_graph_revision(&self, graph_id: &str) -> Result<Option<u64>, AdmissionConflict> {
+        Ok(self.graph_revisions.get(graph_id).copied())
     }
 
-    fn get_node_control_revision(&self, graph_id: &str, node_id: &str) -> Option<u64> {
-        self.node_control_revisions
+    fn get_node_control_revision(
+        &self,
+        graph_id: &str,
+        node_id: &str,
+    ) -> Result<Option<u64>, AdmissionConflict> {
+        Ok(self
+            .node_control_revisions
             .get(&(graph_id.to_string(), node_id.to_string()))
-            .copied()
+            .copied())
     }
 
-    fn is_invocation_settled(&self, graph_id: &str, node_id: &str, invocation_id: &str) -> bool {
-        self.settled_invocations.contains(&(
+    fn is_invocation_settled(
+        &self,
+        graph_id: &str,
+        node_id: &str,
+        invocation_id: &str,
+    ) -> Result<bool, AdmissionConflict> {
+        Ok(self.settled_invocations.contains(&(
             graph_id.to_string(),
             node_id.to_string(),
             invocation_id.to_string(),
-        ))
+        )))
     }
 
-    fn is_stop_requested(&self, graph_id: &str, target: &str) -> bool {
-        self.stop_requested_targets
+    fn is_stop_requested(&self, graph_id: &str, target: &str) -> Result<bool, AdmissionConflict> {
+        Ok(self
+            .stop_requested_targets
             .contains(&(graph_id.to_string(), target.to_string()))
             || self
                 .stop_requested_targets
-                .contains(&(graph_id.to_string(), "graph".to_string()))
+                .contains(&(graph_id.to_string(), "graph".to_string())))
     }
 
-    fn is_pause_negotiating(&self, graph_id: &str, target: &str) -> bool {
-        self.pause_negotiating_targets
-            .contains(&(graph_id.to_string(), target.to_string()))
+    fn is_pause_negotiating(
+        &self,
+        graph_id: &str,
+        target: &str,
+    ) -> Result<bool, AdmissionConflict> {
+        Ok(self
+            .pause_negotiating_targets
+            .contains(&(graph_id.to_string(), target.to_string())))
     }
 
-    fn is_graph_barrier_active(&self, graph_id: &str) -> bool {
-        self.graph_barriers.contains(graph_id)
+    fn is_graph_barrier_active(&self, graph_id: &str) -> Result<bool, AdmissionConflict> {
+        Ok(self.graph_barriers.contains(graph_id))
     }
 
-    fn get_target_generation(&self, graph_id: &str, target: &str) -> Option<u64> {
-        self.target_generations
+    fn get_target_generation(
+        &self,
+        graph_id: &str,
+        target: &str,
+    ) -> Result<Option<u64>, AdmissionConflict> {
+        Ok(self
+            .target_generations
             .get(&(graph_id.to_string(), target.to_string()))
-            .copied()
+            .copied())
     }
 
-    fn is_grant_revoked(&self, principal_id: &str, grant: &OperationGrant) -> bool {
-        self.revoked_grants
-            .contains(&(principal_id.to_string(), grant.clone()))
+    fn is_grant_revoked(
+        &self,
+        principal_id: &str,
+        grant: &OperationGrant,
+    ) -> Result<bool, AdmissionConflict> {
+        Ok(self
+            .revoked_grants
+            .contains(&(principal_id.to_string(), grant.clone())))
     }
 
-    fn find_idempotency_record(&self, request_id: &str) -> Option<(AdmissionReceipt, String)> {
-        self.idempotency_log.get(request_id).cloned()
+    fn find_idempotency_record(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<(AdmissionReceipt, String)>, AdmissionConflict> {
+        Ok(self.idempotency_log.get(request_id).cloned())
     }
 
     fn record_admission(
         &mut self,
         receipt: &mut AdmissionReceipt,
         payload_digest: String,
+        expected_control_revision: Option<u64>,
     ) -> Result<(), AdmissionConflict> {
         receipt.admitted_sequence = self.next_sequence;
         self.next_sequence += 1;
 
         // Persist the admitted control revision so a competing exclusive
-        // control based on the previous revision conflicts.
+        // control based on the previous revision conflicts; the expected
+        // revision is compared at commit, matching the durable store's
+        // compare-and-swap.
         if let Some(node) = &receipt.target_node_id {
+            let persisted = self
+                .node_control_revisions
+                .get(&(receipt.graph_id.clone(), node.clone()))
+                .copied()
+                .unwrap_or(0);
+            if let Some(expected) = expected_control_revision
+                && expected != persisted
+            {
+                return Err(AdmissionConflict::ControlRevisionConflict {
+                    target_node_id: node.clone(),
+                    expected,
+                    current: persisted,
+                    reason: "competing exclusive control revision conflict".to_string(),
+                });
+            }
+            receipt.control_revision = persisted + 1;
             self.node_control_revisions.insert(
                 (receipt.graph_id.clone(), node.clone()),
                 receipt.control_revision,
@@ -726,20 +830,24 @@ impl<S: ControlledStore> InterventionProxy<S> {
 
     /// Authorization effective at use: the principal holds at least one grant
     /// covering the requirement that has not been revoked. A local
-    /// administrator's authority is implicit and not grant-revocable here.
+    /// administrator's authority is implicit and not grant-revocable here. A
+    /// revocation lookup that fails is an error, not a pass: grants are
+    /// effective only when the check actually ran.
     fn has_effective_grant(
         &self,
         principal: &VerifiedPrincipal,
         required: &OperationGrant,
-    ) -> bool {
+    ) -> Result<bool, AdmissionConflict> {
         if principal.is_local_admin() {
-            return true;
+            return Ok(true);
         }
         let principal_id = principal.principal_id();
-        principal
-            .covering_grants(required)
-            .into_iter()
-            .any(|grant| !self.store.is_grant_revoked(&principal_id, grant))
+        for grant in principal.covering_grants(required) {
+            if !self.store.is_grant_revoked(&principal_id, grant)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Admit an operation through the Proxy into the queue.
@@ -762,7 +870,7 @@ impl<S: ControlledStore> InterventionProxy<S> {
                 reason: "principal does not hold required grant".to_string(),
             });
         }
-        if !self.has_effective_grant(principal, &required_grant) {
+        if !self.has_effective_grant(principal, &required_grant)? {
             return Err(AdmissionConflict::PermissionDenied {
                 principal_id,
                 graph_id: request.graph_id,
@@ -773,7 +881,7 @@ impl<S: ControlledStore> InterventionProxy<S> {
         // 2. Idempotency verification: Same logical request redelivered
         let payload_digest = request.payload_digest();
         if let Some((existing_receipt, existing_digest)) =
-            self.store.find_idempotency_record(&request.request_id)
+            self.store.find_idempotency_record(&request.request_id)?
         {
             if existing_digest == payload_digest {
                 let mut replay = existing_receipt;
@@ -789,7 +897,7 @@ impl<S: ControlledStore> InterventionProxy<S> {
         }
 
         // 3. Graph scope barrier check
-        if self.store.is_graph_barrier_active(&request.graph_id)
+        if self.store.is_graph_barrier_active(&request.graph_id)?
             && let ControlOperation::SubmitTask { .. } = request.operation
         {
             return Err(AdmissionConflict::ScopeAdmissionBarrier {
@@ -827,11 +935,14 @@ impl<S: ControlledStore> InterventionProxy<S> {
         };
         let stopped_target = if self
             .store
-            .is_stop_requested(&request.graph_id, &target_scope_str)
+            .is_stop_requested(&request.graph_id, &target_scope_str)?
         {
             Some(target_scope_str.clone())
         } else {
-            invocation_scope_str.filter(|key| self.store.is_stop_requested(&request.graph_id, key))
+            match invocation_scope_str {
+                Some(key) if self.store.is_stop_requested(&request.graph_id, &key)? => Some(key),
+                _ => None,
+            }
         };
 
         if let Some(target) = stopped_target {
@@ -861,7 +972,7 @@ impl<S: ControlledStore> InterventionProxy<S> {
             && let Some(node) = target_node
             && self
                 .store
-                .is_invocation_settled(&request.graph_id, node, invocation_id)
+                .is_invocation_settled(&request.graph_id, node, invocation_id)?
         {
             return Err(AdmissionConflict::InvocationSettled {
                 target_node_id: node.to_string(),
@@ -874,7 +985,7 @@ impl<S: ControlledStore> InterventionProxy<S> {
         if let ControlOperation::Resume { .. } = request.operation
             && self
                 .store
-                .is_pause_negotiating(&request.graph_id, &target_scope_str)
+                .is_pause_negotiating(&request.graph_id, &target_scope_str)?
         {
             return Err(AdmissionConflict::PendingTransition {
                 target: target_scope_str,
@@ -886,7 +997,7 @@ impl<S: ControlledStore> InterventionProxy<S> {
         // 7. Graph definition revision check
         let current_graph_rev = self
             .store
-            .get_graph_revision(&request.graph_id)
+            .get_graph_revision(&request.graph_id)?
             .unwrap_or(1);
         if let Some(expected_rev) = request.expected_graph_revision
             && expected_rev != current_graph_rev
@@ -898,10 +1009,11 @@ impl<S: ControlledStore> InterventionProxy<S> {
             });
         }
 
-        // 8. Exclusive node control revision check
+        // 8. Exclusive node control revision check — a pre-transaction
+        // preview only; the durable store re-verifies it inside the commit.
         let current_control_rev = if let Some(node) = target_node {
             self.store
-                .get_node_control_revision(&request.graph_id, node)
+                .get_node_control_revision(&request.graph_id, node)?
                 .unwrap_or(0)
         } else {
             0
@@ -921,7 +1033,7 @@ impl<S: ControlledStore> InterventionProxy<S> {
         if let Some(expected_gen) = request.expected_target_generation {
             let current_gen = self
                 .store
-                .get_target_generation(&request.graph_id, &target_scope_str)
+                .get_target_generation(&request.graph_id, &target_scope_str)?
                 .unwrap_or(1);
             if expected_gen != current_gen {
                 return Err(AdmissionConflict::StaleTargetGeneration {
@@ -948,7 +1060,11 @@ impl<S: ControlledStore> InterventionProxy<S> {
             is_replay: false,
         };
 
-        self.store.record_admission(&mut receipt, payload_digest)?;
+        self.store.record_admission(
+            &mut receipt,
+            payload_digest,
+            request.expected_control_revision,
+        )?;
         Ok(receipt)
     }
 
@@ -969,7 +1085,7 @@ impl<S: ControlledStore> InterventionProxy<S> {
                 reason: "principal does not have read grant for this graph".to_string(),
             });
         }
-        if !self.has_effective_grant(principal, &read_grant) {
+        if !self.has_effective_grant(principal, &read_grant)? {
             return Err(AdmissionConflict::PermissionDenied {
                 principal_id: principal.principal_id(),
                 graph_id: graph_id.to_string(),
@@ -984,17 +1100,17 @@ impl<S: ControlledStore> InterventionProxy<S> {
         &self,
         principal: &VerifiedPrincipal,
         receipts: &[AdmissionReceipt],
-    ) -> Vec<AdmissionReceipt> {
-        receipts
-            .iter()
-            .filter(|receipt| {
-                let read_grant = OperationGrant::ReadScope {
-                    graph_id: receipt.graph_id.clone(),
-                };
-                self.has_effective_grant(principal, &read_grant)
-            })
-            .cloned()
-            .collect()
+    ) -> Result<Vec<AdmissionReceipt>, AdmissionConflict> {
+        let mut visible = Vec::new();
+        for receipt in receipts {
+            let read_grant = OperationGrant::ReadScope {
+                graph_id: receipt.graph_id.clone(),
+            };
+            if self.has_effective_grant(principal, &read_grant)? {
+                visible.push(receipt.clone());
+            }
+        }
+        Ok(visible)
     }
 }
 
@@ -1537,8 +1653,9 @@ mod tests {
             is_replay: false,
         };
 
-        let filtered =
-            proxy.filter_admitted_receipts(&authorized_user, &[receipt1.clone(), receipt2]);
+        let filtered = proxy
+            .filter_admitted_receipts(&authorized_user, &[receipt1.clone(), receipt2])
+            .unwrap();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].graph_id, graph_id);
     }
@@ -1812,7 +1929,12 @@ mod tests {
             timestamp_unix_ms: 1000,
         };
         proxy.admit(&admin, pause_req).expect("pause admitted");
-        assert!(proxy.store().is_pause_negotiating(&graph_id, "node-1"));
+        assert!(
+            proxy
+                .store()
+                .is_pause_negotiating(&graph_id, "node-1")
+                .unwrap()
+        );
 
         let resume_req = AdmissionRequest {
             request_id: "req-resume-mark".to_string(),

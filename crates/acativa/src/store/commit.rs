@@ -10,14 +10,24 @@ use crate::workflow::machine::{ReducerEvent, RunSnapshot};
 use super::store::StrategyStore;
 
 /// A transition intent stored in the same transaction as the run event and
-/// snapshot.  It remains pending until the post-commit observer completes.
+/// snapshot.  It remains pending until the post-commit observer completes,
+/// and the row is deleted on acknowledgement — a dispatched intent carries no
+/// information the event log does not already hold.
+///
+/// `before`/`after` carry the complete run-level state but only the commands
+/// this event touched; the authoritative command ledger is the store's
+/// command table ([`StrategyStore::run`]), not the transition payload.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransitionIntent {
     pub run_id: String,
     pub sequence: u64,
     pub event: ReducerEvent,
+    /// Run-level state before the event; `commands` holds the touched
+    /// commands' previous records.
     pub before: RunSnapshot,
+    /// Run-level state after the event; `commands` holds the touched
+    /// commands' new records.
     pub after: RunSnapshot,
     pub created_at_unix_ms: i64,
 }
@@ -82,11 +92,29 @@ impl TransitionDecorator {
     /// back the already committed workflow state.
     pub fn apply_event(&self, run_id: &str, event: ReducerEvent) -> Result<RunSnapshot> {
         let committed = self.store.apply_event_with_commit(run_id, event)?;
-        let Some(committed) = committed else {
+        let Some((intent, after)) = committed else {
             return self.store.run(run_id);
         };
-        self.dispatch(committed.clone());
-        Ok(committed.after)
+        self.dispatch(intent);
+        Ok(after)
+    }
+
+    /// Apply a command lifecycle event on behalf of the claim's recorded
+    /// owner; see [`StrategyStore::apply_owned_event`].
+    pub fn apply_owned_event(
+        &self,
+        run_id: &str,
+        claimant: &str,
+        event: ReducerEvent,
+    ) -> Result<RunSnapshot> {
+        let committed = self
+            .store
+            .apply_event_inner(run_id, event, Some(claimant))?;
+        let Some((intent, after)) = committed else {
+            return self.store.run(run_id);
+        };
+        self.dispatch(intent);
+        Ok(after)
     }
 
     /// Replay pending post-commit intents.  The same durable identity is used
@@ -149,12 +177,14 @@ impl StrategyStore {
     }
 
     pub(crate) fn acknowledge_transition_intent(&self, run_id: &str, sequence: u64) -> Result<()> {
+        // Dispatched intents are deleted, not archived: the durable event log
+        // is already the record of the transition, so retaining the payload
+        // would grow the table with data nothing reads.
         let changed = self.with_connection(|connection| -> anyhow::Result<usize> {
             Ok(connection.execute(
-                "UPDATE workflow_transition_intents
-                 SET status='dispatched', dispatched_at=?3
+                "DELETE FROM workflow_transition_intents
                  WHERE run_id=?1 AND sequence=?2 AND status='pending'",
-                params![run_id, sequence as i64, unix_ms()],
+                params![run_id, sequence as i64],
             )?)
         })?;
         if changed == 1 {
@@ -193,6 +223,9 @@ pub(crate) fn insert_intent(
     after: &RunSnapshot,
     created_at: i64,
 ) -> Result<()> {
+    // Persist the transition delta: run-level state plus only the commands
+    // this event touched. Two full snapshots per event would make storage and
+    // serialization grow quadratically with a run's command history.
     transaction.execute(
         "INSERT INTO workflow_transition_intents(
            run_id, sequence, event_json, before_json, after_json,
@@ -202,19 +235,12 @@ pub(crate) fn insert_intent(
             run_id,
             sequence as i64,
             serde_json::to_string(event)?,
-            serde_json::to_string(before)?,
-            serde_json::to_string(after)?,
+            serde_json::to_string(&super::store::transition_delta(before, after))?,
+            serde_json::to_string(&super::store::transition_delta(after, before))?,
             created_at,
         ],
     )?;
     Ok(())
-}
-
-fn unix_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -342,15 +368,8 @@ mod tests {
 
         assert_eq!(decorator.reconcile_pending().unwrap(), 0);
         assert_eq!(decorator.reconcile_pending().unwrap(), 1);
-        let command = run.commands.values().next().unwrap();
         let after = decorator
-            .apply_event(
-                &run.run_id,
-                ReducerEvent::CommandClaimed {
-                    command_id: command.id.clone(),
-                    attempt_token: command.attempt_token.clone(),
-                },
-            )
+            .apply_event(&run.run_id, ReducerEvent::CancelRequested)
             .unwrap();
         assert_eq!(after.sequence, run.sequence + 1);
         assert_eq!(*observed_sequences.lock().unwrap(), vec![1, 2]);
