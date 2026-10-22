@@ -248,11 +248,11 @@ impl NodeFacade {
 
     /// Submit a task to this node.
     ///
-    /// Authorization is upstream at `InterventionProxy::admit`: by the time
-    /// work reaches the facade it is already admitted, so submit takes no
-    /// principal — accepting one here would only pretend a second trust
-    /// boundary that does not exist.
-    pub fn submit(
+    /// Crate-internal: the only caller is `ContinuousNodeDriver`'s dispatch
+    /// loop, which runs after `InterventionProxy::admit` has authorized the
+    /// work. Keeping this private closes the path where an external caller
+    /// drives an adapter invocation around admission entirely.
+    pub(crate) fn submit(
         &mut self,
         input: Value,
         current_cursor: u64,

@@ -597,18 +597,23 @@ pub fn recheck_before_effect(
         });
     }
 
-    // 3. Resource Recheck: check single-writer lock and token budget limits.
-    // When the caller asked for exclusivity, a session with no recorded
-    // writer cannot satisfy the recheck — an absent reservation is a
-    // missing fact, not a verified one, so it fails closed.
-    if let (Some(registry), Some(session)) = (ctx.single_writer_registry, ctx.session_id) {
+    // 3. Resource Recheck: check single-writer lock and token budget
+    // limits. A declared session without a registry to verify it against,
+    // or a session with no recorded writer, cannot prove exclusivity — an
+    // absent fact is not a verified one, so both fail closed.
+    if let Some(session) = ctx.session_id {
+        let Some(registry) = ctx.single_writer_registry else {
+            return Err(EffectRecheckFailure::ResourceUnavailable {
+                code: "session_registry_missing".into(),
+                reason: format!("Session '{session}' was declared but no writer registry backs it"),
+            });
+        };
         match registry.current_writer(session) {
             Some(active_writer) if active_writer != ctx.claimant => {
                 return Err(EffectRecheckFailure::ResourceUnavailable {
                     code: "session_writer_conflict".into(),
                     reason: format!(
-                        "Session '{}' is currently locked by claimant '{}'",
-                        session, active_writer
+                        "Session '{session}' is currently locked by claimant '{active_writer}'"
                     ),
                 });
             }
@@ -648,4 +653,96 @@ pub fn recheck_before_effect(
         version_verified: true,
         resource_verified: true,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::StrategyAuthorization;
+
+    fn active_authorization() -> StrategyAuthorization {
+        StrategyAuthorization {
+            definition_digest: "def".into(),
+            semantics_digest: "sem".into(),
+            binding_digest: "bind".into(),
+            authorization_digest: "auth".into(),
+            revision: 1,
+            active: true,
+        }
+    }
+
+    fn base_context<'a>(authorization: &'a StrategyAuthorization) -> EffectRecheckContext<'a> {
+        EffectRecheckContext {
+            run_id: "run:test",
+            command_id: "cmd:test",
+            definition_revision: "rev:test",
+            expected_revision: "rev:test",
+            expected_generation: 1,
+            current_generation: 1,
+            authorization: Some(authorization),
+            claimant: "claimant",
+            session_id: None,
+            single_writer_registry: None,
+            required_tokens: None,
+            token_budget_remaining: None,
+        }
+    }
+
+    #[test]
+    fn declared_session_without_registry_fails_closed() {
+        let authorization = active_authorization();
+        let mut ctx = base_context(&authorization);
+        ctx.session_id = Some("session:test");
+        let failure = recheck_before_effect(&ctx).unwrap_err();
+        assert!(matches!(
+            failure,
+            EffectRecheckFailure::ResourceUnavailable { ref code, .. }
+                if code == "session_registry_missing"
+        ));
+    }
+
+    #[test]
+    fn session_without_recorded_writer_fails_closed() {
+        let authorization = active_authorization();
+        let registry = SingleWriterSessionRegistry::new();
+        let mut ctx = base_context(&authorization);
+        ctx.session_id = Some("session:test");
+        ctx.single_writer_registry = Some(&registry);
+        let failure = recheck_before_effect(&ctx).unwrap_err();
+        assert!(matches!(
+            failure,
+            EffectRecheckFailure::ResourceUnavailable { ref code, .. }
+                if code == "session_writer_missing"
+        ));
+    }
+
+    #[test]
+    fn session_owned_by_another_writer_fails_closed() {
+        let authorization = active_authorization();
+        let registry = SingleWriterSessionRegistry::new();
+        registry
+            .acquire_writer("session:test", "other-claimant")
+            .unwrap();
+        let mut ctx = base_context(&authorization);
+        ctx.session_id = Some("session:test");
+        ctx.single_writer_registry = Some(&registry);
+        let failure = recheck_before_effect(&ctx).unwrap_err();
+        assert!(matches!(
+            failure,
+            EffectRecheckFailure::ResourceUnavailable { ref code, .. }
+                if code == "session_writer_conflict"
+        ));
+    }
+
+    #[test]
+    fn session_owned_by_claimant_verifies() {
+        let authorization = active_authorization();
+        let registry = SingleWriterSessionRegistry::new();
+        registry.acquire_writer("session:test", "claimant").unwrap();
+        let mut ctx = base_context(&authorization);
+        ctx.session_id = Some("session:test");
+        ctx.single_writer_registry = Some(&registry);
+        let receipt = recheck_before_effect(&ctx).unwrap();
+        assert!(receipt.resource_verified);
+    }
 }

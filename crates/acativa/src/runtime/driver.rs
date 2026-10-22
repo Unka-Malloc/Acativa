@@ -218,7 +218,10 @@ impl From<NodeExecutionError> for DriverError {
 /// Continuous driver orchestrating node facades, feature indexing, queues, and result re-entry.
 pub struct ContinuousNodeDriver {
     pub graph_id: String,
-    pub nodes: BTreeMap<String, NodeFacade>,
+    /// Facades are crate-internal: mutable node access would hand callers a
+    /// `submit` path around `InterventionProxy::admit`. Hosts register
+    /// facades; the driver owns their dispatch from there.
+    nodes: BTreeMap<String, NodeFacade>,
     pub index: NodeFeatureIndex,
     /// The dispatch queue is private: admitted work enters only through
     /// `InterventionProxy` — handing the queue to callers would hand them a
@@ -257,12 +260,14 @@ impl ContinuousNodeDriver {
     }
 
     /// Access a node facade by ID.
-    pub fn get_node(&self, node_id: &str) -> Option<&NodeFacade> {
+    #[cfg(test)]
+    pub(crate) fn get_node(&self, node_id: &str) -> Option<&NodeFacade> {
         self.nodes.get(node_id)
     }
 
     /// Mutably access a node facade by ID.
-    pub fn get_node_mut(&mut self, node_id: &str) -> Option<&mut NodeFacade> {
+    #[cfg(test)]
+    pub(crate) fn get_node_mut(&mut self, node_id: &str) -> Option<&mut NodeFacade> {
         self.nodes.get_mut(node_id)
     }
 

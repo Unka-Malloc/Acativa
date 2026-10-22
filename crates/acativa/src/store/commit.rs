@@ -79,6 +79,7 @@ impl TransitionDecorator {
     }
 
     pub fn with_observer(mut self, observer: Arc<dyn TransitionObserver>) -> Self {
+        self.store.observe_transitions();
         self.observer = Some(observer);
         self
     }

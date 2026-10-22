@@ -88,6 +88,12 @@ pub struct StrategyStore {
     /// in-memory store is removed when the last handle goes away.
     #[allow(dead_code)]
     scratch_dir: Option<std::sync::Arc<ScratchDir>>,
+    /// Transition intents persist by default: they are the durable outbox
+    /// a `TransitionDecorator` reconciles, including transitions committed
+    /// before the decorator attached. A host that will never attach an
+    /// observer disables the outbox explicitly through
+    /// `suppress_transition_intents`.
+    transition_intents: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl StrategyStore {
@@ -108,6 +114,7 @@ impl StrategyStore {
             db_path,
             dialect: dialect.clone(),
             scratch_dir: None,
+            transition_intents: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         store.with_connection(|connection| {
             if existed {
@@ -138,6 +145,7 @@ impl StrategyStore {
         let store = Self {
             db_path: root.join(DATABASE_FILE),
             dialect: dialect.clone(),
+            transition_intents: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             scratch_dir: Some(std::sync::Arc::new(ScratchDir { path: root })),
         };
         store.with_connection(initialize_schema)?;
@@ -148,6 +156,26 @@ impl StrategyStore {
     /// The dialect this store was opened under.
     pub fn dialect(&self) -> &StoreDialect {
         &self.dialect
+    }
+
+    /// Stop persisting transition intents: a host on the direct event API
+    /// that never attaches an observer uses this to bound the outbox table
+    /// instead of accumulating rows nothing will acknowledge. Existing
+    /// rows are untouched; subsequent transitions skip the outbox insert.
+    /// Attaching a `TransitionDecorator` observer re-enables persistence.
+    pub fn suppress_transition_intents(&self) {
+        self.transition_intents
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn observe_transitions(&self) {
+        self.transition_intents
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn expects_transition_observers(&self) -> bool {
+        self.transition_intents
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn db_path(&self) -> &Path {
@@ -648,6 +676,7 @@ impl StrategyStore {
                 &event,
                 &output.emitted_commands,
                 now,
+                self.expects_transition_observers(),
             )?;
             transaction.commit()?;
             Ok(snapshot)
@@ -860,6 +889,7 @@ impl StrategyStore {
                 &event,
                 &output.emitted_commands,
                 now,
+                self.expects_transition_observers(),
             )?;
             transaction.commit()?;
             Ok((snapshot, true))
@@ -884,42 +914,34 @@ impl StrategyStore {
         self.with_connection(|connection| load_run(connection, run_id))
     }
 
-    /// Prune retained history for terminal runs, keeping the newest
-    /// `keep_per_run` event rows and pending transition intents of each.
+    /// Prune retained event payloads for terminal runs, keeping the newest
+    /// `keep_per_run` rows of each.
     ///
-    /// Retention contract: event history and undelivered transition intents
-    /// are an audit trail the host owns — the store appends every
-    /// transition so `history_count` and replay tooling stay complete for
-    /// as long as the host needs them, and the host bounds that growth by
-    /// calling this on whatever cadence its storage budget allows.
-    /// Non-terminal runs are never touched: a live run's history and its
-    /// pending intents are still load-bearing.
+    /// Retention contract: event history is an audit trail the host owns —
+    /// the store appends every transition so `history_count` and replay
+    /// tooling stay complete for as long as the host needs them, and the
+    /// host bounds that growth by calling this on whatever cadence its
+    /// storage budget allows. Pending transition intents are deliberately
+    /// untouched: they are unacknowledged deliveries, not history, and a
+    /// later reconcile still owns them. Non-terminal runs are never
+    /// touched either — a live run's history is still load-bearing.
     pub fn prune_terminal_events(&self, keep_per_run: u64) -> Result<u64> {
         self.with_connection(|connection| {
             let keep = keep_per_run.min(i64::MAX as u64) as i64;
-            let mut deleted = connection.execute(
-                "DELETE FROM strategy_run_events
-                 WHERE run_id IN (SELECT run_id FROM strategy_runs WHERE terminal=1)
-                   AND sequence < COALESCE(
-                       (SELECT MIN(sequence) FROM (
-                           SELECT sequence FROM strategy_run_events retained
-                           WHERE retained.run_id = strategy_run_events.run_id
-                           ORDER BY sequence DESC LIMIT ?1)),
-                       9223372036854775807)",
-                params![keep],
-            )?;
-            deleted += connection.execute(
-                "DELETE FROM workflow_transition_intents
-                 WHERE run_id IN (SELECT run_id FROM strategy_runs WHERE terminal=1)
-                   AND sequence < COALESCE(
-                       (SELECT MIN(sequence) FROM (
-                           SELECT sequence FROM workflow_transition_intents retained
-                           WHERE retained.run_id = workflow_transition_intents.run_id
-                           ORDER BY sequence DESC LIMIT ?1)),
-                       9223372036854775807)",
-                params![keep],
-            )?;
-            Ok(deleted as u64)
+            connection
+                .execute(
+                    "DELETE FROM strategy_run_events
+                     WHERE run_id IN (SELECT run_id FROM strategy_runs WHERE terminal=1)
+                       AND sequence < COALESCE(
+                           (SELECT MIN(sequence) FROM (
+                               SELECT sequence FROM strategy_run_events retained
+                               WHERE retained.run_id = strategy_run_events.run_id
+                               ORDER BY sequence DESC LIMIT ?1)),
+                           9223372036854775807)",
+                    params![keep],
+                )
+                .map(|deleted| deleted as u64)
+                .map_err(Into::into)
         })
     }
 
@@ -985,6 +1007,7 @@ impl StrategyStore {
                     &event,
                     &output.emitted_commands,
                     now,
+                    self.expects_transition_observers(),
                 )?;
                 transaction.execute(
                     "UPDATE strategy_runs SET snapshot_json=?2, context_id=?3,
@@ -1087,6 +1110,7 @@ impl StrategyStore {
                 &event,
                 &output.emitted_commands,
                 now,
+                self.expects_transition_observers(),
             )?;
             transaction.execute(
                 "UPDATE strategy_runs SET snapshot_json=?2, context_id=?3,
@@ -1285,6 +1309,7 @@ impl StrategyStore {
                 &failure_event,
                 &failure.emitted_commands,
                 now,
+                self.expects_transition_observers(),
             )?;
             let final_snapshot = if failure
                 .snapshot
@@ -1303,6 +1328,7 @@ impl StrategyStore {
                     &retry_event,
                     &retry.emitted_commands,
                     now,
+                    self.expects_transition_observers(),
                 )?;
                 retry.snapshot
             } else {
@@ -1953,6 +1979,7 @@ fn persist_event_and_commands(
     event: &ReducerEvent,
     emitted: &[RunCommand],
     now: i64,
+    record_intent: bool,
 ) -> Result<()> {
     let event_json = serde_json::to_string(event)?;
     let event_type = event_json.split('"').nth(3).unwrap_or("event").to_owned();
@@ -1967,15 +1994,17 @@ fn persist_event_and_commands(
             now
         ],
     )?;
-    super::commit::insert_intent(
-        transaction,
-        &snapshot.run_id,
-        snapshot.sequence,
-        event,
-        before,
-        snapshot,
-        now,
-    )?;
+    if record_intent {
+        super::commit::insert_intent(
+            transaction,
+            &snapshot.run_id,
+            snapshot.sequence,
+            event,
+            before,
+            snapshot,
+            now,
+        )?;
+    }
     for command in emitted {
         transaction.execute(
             "INSERT INTO strategy_commands(
@@ -2928,12 +2957,12 @@ mod tests {
             StrategyRunStatus::Completed
         );
 
-        let count = |table: &str, run_id: &str| -> i64 {
+        let count = |run_id: &str| -> i64 {
             store
                 .with_connection(|connection| {
                     connection
                         .query_row(
-                            &format!("SELECT COUNT(*) FROM {table} WHERE run_id=?1"),
+                            "SELECT COUNT(*) FROM strategy_run_events WHERE run_id=?1",
                             params![run_id],
                             |row| row.get(0),
                         )
@@ -2941,25 +2970,56 @@ mod tests {
                 })
                 .unwrap()
         };
-        let terminal_events = count("strategy_run_events", &done.run_id);
-        let terminal_intents = count("workflow_transition_intents", &done.run_id);
-        let live_events = count("strategy_run_events", &live.run_id);
+        let terminal_events = count(&done.run_id);
+        let live_events = count(&live.run_id);
         assert!(terminal_events > 2 && live_events > 0);
 
-        // Keep only the newest row on the terminal run, in both tables; the
-        // live run's history is still load-bearing and must be untouched.
+        // Keep only the newest event on the terminal run; the live run's
+        // history is still load-bearing and must be untouched.
         let pruned = store.prune_terminal_events(1).unwrap();
-        assert_eq!(
-            pruned,
-            (terminal_events + terminal_intents - 2).max(0) as u64
-        );
-        assert_eq!(count("strategy_run_events", &done.run_id), 1);
-        assert_eq!(
-            count("workflow_transition_intents", &done.run_id),
-            terminal_intents.min(1)
-        );
-        assert_eq!(count("strategy_run_events", &live.run_id), live_events);
+        assert_eq!(pruned, terminal_events as u64 - 1);
+        assert_eq!(count(&done.run_id), 1);
+        assert_eq!(count(&live.run_id), live_events);
         // Idempotent: nothing left beyond the retained window.
         assert_eq!(store.prune_terminal_events(1).unwrap(), 0);
+    }
+
+    #[test]
+    fn suppressed_outbox_persists_no_transition_intents() {
+        let store = StrategyStore::open_in_memory().unwrap();
+        let revision = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        store
+            .register_definition(
+                revision,
+                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                &workflow(),
+                1,
+                1,
+            )
+            .unwrap();
+        store
+            .update_binding(revision, "worker", "agent:test", "", "", None)
+            .unwrap();
+        let authorization = store.authorization_preview(revision).unwrap();
+        store
+            .grant_authorization(revision, &authorization.authorization_digest)
+            .unwrap();
+
+        // Default: the outbox is on so a decorator attached later can still
+        // reconcile this transition's backlog.
+        let observed = store
+            .start_run(revision, json!({}), "outbox-on", None, None)
+            .unwrap();
+        assert!(!store.pending_transition_intents().unwrap().is_empty());
+
+        // Suppressed: a host on the direct API that never observes stops
+        // accumulating rows nothing would acknowledge.
+        store.suppress_transition_intents();
+        store
+            .start_run(revision, json!({}), "outbox-off", None, None)
+            .unwrap();
+        let pending = store.pending_transition_intents().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].run_id, observed.run_id);
     }
 }
