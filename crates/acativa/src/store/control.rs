@@ -593,7 +593,7 @@ pub struct AdmissionFences {
 /// lock. `evaluate_fences` turns facts into the same conflict the
 /// pre-commit checks would have raised.
 #[derive(Clone, Debug)]
-pub(crate) struct FenceFacts {
+pub struct FenceFacts {
     pub covering_grants_all_revoked: bool,
     pub barrier_active: bool,
     pub stopped_scope: Option<String>,
@@ -604,8 +604,10 @@ pub(crate) struct FenceFacts {
 }
 
 /// Authoritative fence evaluation: identical conflicts to the proxy's
-/// prechecks, raised inside the committing transaction.
-pub(crate) fn evaluate_fences(
+/// prechecks, raised inside the committing transaction. `ControlledStore`
+/// implementors call this after gathering [`FenceFacts`] under their write
+/// lock — it is part of the port contract, not an internal helper.
+pub fn evaluate_fences(
     receipt: &AdmissionReceipt,
     fences: &AdmissionFences,
     facts: FenceFacts,
