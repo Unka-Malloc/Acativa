@@ -746,6 +746,10 @@ mod tests {
                 max_entries: 100,
                 max_bytes: 1024 * 1024,
             },
+            QueueBounds {
+                max_entries: 100,
+                max_bytes: 1024 * 1024,
+            },
             4,
         )
     }

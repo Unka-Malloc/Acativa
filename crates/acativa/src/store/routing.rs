@@ -612,6 +612,11 @@ impl std::error::Error for QueueCapacityExceeded {}
 
 /// Fair dispatch queue maintaining separate Control and Data channels with
 /// strict capacity bounds and a deficit/quantum fair arbiter to prevent starvation.
+///
+/// Retention is bounded independently of delivery capacity: `replay_bounds`
+/// limits how much history the replay log holds, and entries past the bound
+/// are evicted oldest-first. Without it an in-memory queue would grow with
+/// the lifetime throughput of the host, not with the work in flight.
 #[derive(Clone, Debug)]
 pub struct FairDispatchQueue {
     control_bounds: QueueBounds,
@@ -621,9 +626,11 @@ pub struct FairDispatchQueue {
     control_bytes: usize,
     data_bytes: usize,
     next_cursor: u64,
-    /// Historical replay log. Retention and truncation belong to the durable
-    /// wiring; this in-memory leaf retains the full log.
-    durable_log: Vec<QueuedItem>,
+    /// Bounded replay window: the newest `replay_bounds` worth of enqueued
+    /// items, evicted oldest-first.
+    replay_log: VecDeque<QueuedItem>,
+    replay_bounds: QueueBounds,
+    replay_bytes: usize,
     /// Quantum: number of control items dispatched before checking data queue.
     control_quantum: usize,
     control_dispatched_in_quantum: usize,
@@ -633,6 +640,7 @@ impl FairDispatchQueue {
     pub fn new(
         control_bounds: QueueBounds,
         data_bounds: QueueBounds,
+        replay_bounds: QueueBounds,
         control_quantum: usize,
     ) -> Self {
         Self {
@@ -643,7 +651,9 @@ impl FairDispatchQueue {
             control_bytes: 0,
             data_bytes: 0,
             next_cursor: 1,
-            durable_log: Vec::new(),
+            replay_log: VecDeque::new(),
+            replay_bounds,
+            replay_bytes: 0,
             control_quantum: control_quantum.max(1),
             control_dispatched_in_quantum: 0,
         }
@@ -701,7 +711,7 @@ impl FairDispatchQueue {
                 };
                 self.control_bytes += payload_bytes;
                 self.control_queue.push_back(item.clone());
-                self.durable_log.push(item);
+                self.retain_for_replay(item);
                 Ok(cursor)
             }
             ChannelKind::Data => {
@@ -728,8 +738,23 @@ impl FairDispatchQueue {
                 };
                 self.data_bytes += payload_bytes;
                 self.data_queue.push_back(item.clone());
-                self.durable_log.push(item);
+                self.retain_for_replay(item);
                 Ok(cursor)
+            }
+        }
+    }
+
+    /// Keep the newest `replay_bounds` worth of history, evicting the oldest.
+    fn retain_for_replay(&mut self, item: QueuedItem) {
+        self.replay_bytes += item.payload_bytes;
+        self.replay_log.push_back(item);
+        while self.replay_log.len() > self.replay_bounds.max_entries
+            || self.replay_bytes > self.replay_bounds.max_bytes
+        {
+            if let Some(evicted) = self.replay_log.pop_front() {
+                self.replay_bytes = self.replay_bytes.saturating_sub(evicted.payload_bytes);
+            } else {
+                break;
             }
         }
     }
@@ -783,9 +808,12 @@ impl FairDispatchQueue {
         }
     }
 
-    /// Replay messages from a durable cursor (catch-up upon reconnect or recovery).
+    /// Replay retained messages from a cursor (catch-up upon reconnect or
+    /// recovery). History older than the replay window has been evicted: a
+    /// `from_cursor` below the retained floor replays the window, which is
+    /// the bounded retention contract rather than a complete log.
     pub fn replay_from_cursor(&self, from_cursor: u64) -> Vec<QueuedItem> {
-        self.durable_log
+        self.replay_log
             .iter()
             .filter(|item| item.cursor >= from_cursor)
             .cloned()
@@ -1097,7 +1125,7 @@ mod tests {
             max_entries: 2,
             max_bytes: 100,
         };
-        let mut queue = FairDispatchQueue::new(bounds, bounds, 2);
+        let mut queue = FairDispatchQueue::new(bounds, bounds, bounds, 2);
 
         // Enqueue 2 control items (reaches entry bound)
         queue
@@ -1129,7 +1157,7 @@ mod tests {
             max_bytes: 10_000,
         };
         // Quantum = 2: serve 2 control items, then 1 data item if present
-        let mut queue = FairDispatchQueue::new(bounds, bounds, 2);
+        let mut queue = FairDispatchQueue::new(bounds, bounds, bounds, 2);
 
         // Enqueue 4 control items and 2 data items
         queue
@@ -1186,5 +1214,34 @@ mod tests {
         let replay_from_4 = queue.replay_from_cursor(4);
         assert_eq!(replay_from_4.len(), 3);
         assert_eq!(replay_from_4[0].cursor, 4);
+    }
+
+    #[test]
+    fn replay_window_evicts_oldest_past_its_bound() {
+        let bounds = QueueBounds {
+            max_entries: 8,
+            max_bytes: 1024 * 1024,
+        };
+        let replay = QueueBounds {
+            max_entries: 2,
+            max_bytes: 1024 * 1024,
+        };
+        let mut queue = FairDispatchQueue::new(bounds, bounds, replay, 2);
+        for index in 0..4 {
+            queue
+                .enqueue(
+                    ChannelKind::Control,
+                    format!("control-{index}"),
+                    json!({}),
+                    index as i64,
+                )
+                .unwrap();
+        }
+        // Only the retained window replays; the oldest entries are evicted
+        // rather than accumulated for the lifetime of the queue.
+        let retained = queue.replay_from_cursor(1);
+        assert_eq!(retained.len(), 2);
+        assert_eq!(retained[0].cursor, 3);
+        assert_eq!(retained[1].cursor, 4);
     }
 }
