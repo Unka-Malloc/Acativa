@@ -828,6 +828,9 @@ pub fn settle_graph_command(params: &Value) -> LedgerResult<Value> {
         load_or_update_budget_pool(&transaction, &settled.budget_id, BudgetSnapshot::default())?;
     let active = active_reservation_stats(&transaction, &settled.budget_id)?;
     let available = available_tokens(&pool, active);
+    // Terminal transitions are the guaranteed maintenance path: reservations
+    // without a later run start still hit the retention bound.
+    prune_terminal_runs(&transaction)?;
     transaction.commit().map_err(|_| LedgerError::storage())?;
     Ok(settlement_value(
         &settled,
@@ -882,6 +885,7 @@ pub fn release_graph_command(params: &Value) -> LedgerResult<Value> {
         load_or_update_budget_pool(&transaction, &released.budget_id, BudgetSnapshot::default())?;
     let active = active_reservation_stats(&transaction, &released.budget_id)?;
     let available = available_tokens(&pool, active);
+    prune_terminal_runs(&transaction)?;
     transaction.commit().map_err(|_| LedgerError::storage())?;
     Ok(json!({
         "ok": true,
