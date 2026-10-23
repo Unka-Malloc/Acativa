@@ -23,9 +23,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const WORKFLOW_LEDGER_SCHEMA_VERSION: i64 = 2;
 pub const WORKFLOW_LEDGER_FILE_NAME: &str = "graph-usage-ledger-v2.sqlite3";
-pub const WORKFLOW_LEDGER_REPORT_SCHEMA: &str = "licoup.graph-usage-report.v2";
+pub const WORKFLOW_LEDGER_REPORT_SCHEMA: &str = "acativa.graph-usage-report.v2";
 pub const WORKFLOW_LEDGER_RESULT_KIND: &str = "graph-run-usage";
 pub const WORKFLOW_LEDGER_MAX_RUNS: usize = 256;
+/// Terminal reservation rows (`settled`/`released`) are kept for idempotent
+/// replay and reporting, then bounded — replaying against a row beyond this
+/// window reports `usage_ledger_reservation_not_found`, which is the retention
+/// contract, not data loss. Rows whose run has already been pruned are
+/// removed regardless of state: their work is gone and any budget they still
+/// hold is released.
+pub const WORKFLOW_LEDGER_MAX_TERMINAL_RESERVATIONS: usize = 512;
 
 /// A first-time WAL transition does not honor busy_timeout when two
 /// connections open a new ledger concurrently, so bound a retry to keep
@@ -185,8 +192,12 @@ impl UsageAccuracy {
         match value.map(str::trim).filter(|value| !value.is_empty()) {
             Some("exact") => Ok(Self::Exact),
             Some("estimated") => Ok(Self::Estimated),
-            Some("unknown") | None if !has_usage => Ok(Self::Unknown),
-            Some("unknown") | None => Ok(Self::Exact),
+            // An explicit unknown is a claim, not a default to overwrite:
+            // numbers a producer will not vouch for stay unknown even when it
+            // supplies them.
+            Some("unknown") => Ok(Self::Unknown),
+            None if has_usage => Ok(Self::Exact),
+            None => Ok(Self::Unknown),
             _ => Err(LedgerError::invalid("usage_ledger_accuracy_invalid")),
         }
     }
@@ -213,7 +224,7 @@ impl CheckedUsage {
                 "inputTokens",
                 "input_tokens",
             ],
-        )
+        )?
         .unwrap_or(0);
         let cached = numeric_field(
             object,
@@ -223,7 +234,7 @@ impl CheckedUsage {
                 "cacheReadInputTokens",
                 "cache_read_input_tokens",
             ],
-        )
+        )?
         .unwrap_or(0);
         let completion = numeric_field(
             object,
@@ -233,7 +244,7 @@ impl CheckedUsage {
                 "outputTokens",
                 "output_tokens",
             ],
-        )
+        )?
         .unwrap_or(0);
         let total = prompt
             .checked_add(completion)
@@ -241,7 +252,7 @@ impl CheckedUsage {
         if cached > prompt || total > i64::MAX as u64 {
             return Err(LedgerError::invalid("usage_ledger_counter_invalid"));
         }
-        if let Some(submitted_total) = numeric_field(object, &["totalTokens", "total_tokens"])
+        if let Some(submitted_total) = numeric_field(object, &["totalTokens", "total_tokens"])?
             && submitted_total != total
         {
             return Err(LedgerError::invalid("usage_ledger_total_mismatch"));
@@ -513,11 +524,31 @@ pub fn record_graph_command(params: &Value) -> LedgerResult<Value> {
             params![run_id, now],
         )
         .map_err(|_| LedgerError::storage())?;
+    // The reservation lives under its own invocation identity, which callers
+    // may pass directly; otherwise the command id recorded at admission
+    // resolves it. Settling by command id alone would miss a reservation made
+    // under a distinct invocation id and leave budget permanently held.
+    let explicit_invocation = optional_id(params, "invocationId")?;
+    let invocation_id = match explicit_invocation {
+        Some(invocation_id) => Some(invocation_id),
+        None => transaction
+            .query_row(
+                "SELECT invocation_id FROM graph_usage_reservations
+                 WHERE command_id=?1 AND state IN ('reserved','unknown')
+                 ORDER BY updated_at_ms DESC LIMIT 1",
+                params![command_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|_| LedgerError::storage())?,
+    };
     transaction.commit().map_err(|_| LedgerError::storage())?;
-    if let Some(settlement_status) = graph_settlement_status(status) {
+    if let Some(settlement_status) = graph_settlement_status(status)
+        && let Some(invocation_id) = invocation_id
+    {
         let mut settlement = json!({
             "stateRoot": params.get("stateRoot").cloned().unwrap_or(Value::Null),
-            "invocationId": command_id,
+            "invocationId": invocation_id,
             "commandId": command_id,
             "settlementStatus": settlement_status,
             "usage": params.get("usage").cloned().unwrap_or(Value::Null),
@@ -529,9 +560,14 @@ pub fn record_graph_command(params: &Value) -> LedgerResult<Value> {
                 .remove("stateRoot");
         }
         // The Graph usage row remains authoritative even when an older caller
-        // has no admission reservation. A missing reservation is expected for
-        // pre-admission history and is deliberately ignored here.
-        let _ = settle_graph_command(&settlement);
+        // has no admission reservation; a missing reservation stays expected
+        // for pre-admission history. Every other settlement failure — storage,
+        // identity conflict — surfaces instead of silently leaving budget held.
+        match settle_graph_command(&settlement) {
+            Ok(_) => {}
+            Err(error) if error.code == "usage_ledger_reservation_not_found" => {}
+            Err(error) => return Err(error),
+        }
     }
     Ok(json!({
         "runId": run_id,
@@ -552,7 +588,7 @@ fn graph_settlement_status(status: &str) -> Option<&'static str> {
 
 /// Atomically reserve one locally admitted, chargeable invocation from a
 /// budget pool. The pool snapshot is an admission input, not a provider
-/// billing guarantee: estimates can protect LicoUp's own concurrent work but
+/// billing guarantee: estimates can protect the host's own concurrent work but
 /// cannot cap calls made internally by an external Agent.
 pub fn reserve_graph_command(params: &Value) -> LedgerResult<Value> {
     let invocation_id = required_invocation_id(params)?;
@@ -1155,15 +1191,17 @@ fn parse_settlement_usage(params: &Value) -> LedgerResult<Option<CheckedUsage>> 
         "output_tokens",
         "totalTokens",
         "total_tokens",
+        "cachedInputTokens",
+        "cached_input_tokens",
+        "cacheReadInputTokens",
+        "cache_read_input_tokens",
     ]
     .iter()
     .any(|key| object.contains_key(*key));
-    let explicitly_exact = object
-        .get("accuracy")
-        .or_else(|| object.get("usageAccuracy"))
-        .and_then(Value::as_str)
-        == Some("exact");
-    if !has_numeric_fields && !explicitly_exact {
+    // Usage exists only when a counter is actually present: an accuracy label
+    // with no numbers is not evidence, and treating it as exact zeros would
+    // release a reservation on nothing.
+    if !has_numeric_fields {
         return Ok(None);
     }
     let mut normalized = object.clone();
@@ -1331,15 +1369,25 @@ fn active_reservation_stats(
 }
 
 fn available_tokens(pool: &BudgetPool, active: ActiveReservationStats) -> Option<u64> {
-    let base = if let Some(limit) = pool.limit_tokens {
+    // Every reported bound narrows availability. A limit/used pair derives
+    // what remains; a directly observed remainder reports what the provider
+    // now says. Partial snapshots merge by COALESCE, so either value can be
+    // the stale one — the effective ceiling is the stricter of the two, which
+    // under-admits when evidence is old instead of admitting against an
+    // exhausted pool.
+    let limit_based = pool.limit_tokens.map(|limit| {
         let used = pool
             .observed_used_tokens
             .unwrap_or(0)
             .max(pool.actual_tokens);
-        Some(limit.saturating_sub(used))
-    } else {
-        pool.observed_remaining_tokens
-            .map(|remaining| remaining.saturating_sub(pool.actual_tokens))
+        limit.saturating_sub(used)
+    });
+    let remaining_based = pool
+        .observed_remaining_tokens
+        .map(|remaining| remaining.saturating_sub(pool.actual_tokens));
+    let base = match (limit_based, remaining_based) {
+        (Some(derived), Some(observed)) => Some(derived.min(observed)),
+        (single, other) => single.or(other),
     };
     base.map(|available| available.saturating_sub(active.reserved_tokens))
 }
@@ -1945,6 +1993,30 @@ fn prune_terminal_runs(connection: &Connection) -> LedgerResult<()> {
             params![WORKFLOW_LEDGER_MAX_RUNS],
         )
         .map_err(|_| LedgerError::storage())?;
+    // Reservations carry no FK to graph_runs, so prune them here: rows bound
+    // to a run that no longer exists are removed (a held reservation whose
+    // run is gone releases its stale hold), and terminal history is bounded
+    // to the newest window.
+    connection
+        .execute(
+            "DELETE FROM graph_usage_reservations
+             WHERE run_id IS NOT NULL
+               AND run_id NOT IN (SELECT run_id FROM graph_runs)",
+            [],
+        )
+        .map_err(|_| LedgerError::storage())?;
+    connection
+        .execute(
+            "DELETE FROM graph_usage_reservations
+             WHERE state IN ('settled','released')
+               AND invocation_id NOT IN (
+                 SELECT invocation_id FROM graph_usage_reservations
+                 WHERE state IN ('settled','released')
+                 ORDER BY updated_at_ms DESC,invocation_id DESC LIMIT ?1
+               )",
+            params![WORKFLOW_LEDGER_MAX_TERMINAL_RESERVATIONS],
+        )
+        .map_err(|_| LedgerError::storage())?;
     Ok(())
 }
 
@@ -2057,8 +2129,31 @@ fn command_status(value: &str) -> LedgerResult<&str> {
     }
 }
 
-fn numeric_field(object: &Map<String, Value>, keys: &[&str]) -> Option<u64> {
-    keys.iter().find_map(|key| object.get(*key)?.as_u64())
+/// One counter under any of its alias names. Every present alias must be a
+/// non-negative integer, and aliases that disagree conflict instead of the
+/// first parseable one winning — a malformed or contradictory counter is a
+/// refused request, never a silent zero.
+fn numeric_field(object: &Map<String, Value>, keys: &[&str]) -> LedgerResult<Option<u64>> {
+    let mut found: Option<u64> = None;
+    for key in keys {
+        let Some(value) = object.get(*key) else {
+            continue;
+        };
+        if value.is_null() {
+            continue;
+        }
+        let parsed = value
+            .as_u64()
+            .ok_or_else(|| LedgerError::invalid("usage_ledger_counter_invalid"))?;
+        match found {
+            None => found = Some(parsed),
+            Some(first) if first == parsed => {}
+            Some(_) => {
+                return Err(LedgerError::invalid("usage_ledger_counter_conflict"));
+            }
+        }
+    }
+    Ok(found)
 }
 
 pub fn now_ms() -> i64 {
@@ -2587,6 +2682,195 @@ mod tests {
         assert_eq!(denied["code"], "budget_exhausted");
         assert_eq!(denied["admissionMode"], "unknown-estimate");
         assert_eq!(denied["hardCapGuaranteed"], false);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn command_record_settles_reservation_under_a_distinct_invocation() {
+        let root = root();
+        begin_graph_run(&begin(&root)).unwrap();
+        reserve_graph_command(&json!({
+            "stateRoot": root.to_string_lossy(),
+            "budgetId": "pool:linked",
+            "invocationId": "invocation:distinct",
+            "runId": "run:one",
+            "commandId": "command:linked",
+            "budget": {"limitTokens": 20, "usedTokens": 0},
+            "estimate": {"totalTokens": 6, "accuracy": "estimated"}
+        }))
+        .unwrap();
+        // The command record only knows its own identity; the settlement must
+        // still reach the reservation that admitted the work.
+        record_graph_command(&json!({
+            "stateRoot": root.to_string_lossy(),
+            "runId": "run:one",
+            "commandId": "command:linked",
+            "stateId": "state:actor",
+            "kind": "actor",
+            "status": "succeeded",
+            "usage": {"promptTokens": 5, "totalTokens": 5, "accuracy": "exact"}
+        }))
+        .unwrap();
+        let report = graph_admission_report(&json!({
+            "stateRoot": root.to_string_lossy()
+        }))
+        .unwrap();
+        assert_eq!(report["reservations"][0]["state"], "settled");
+        assert_eq!(report["pools"][0]["actualTokens"], 5);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn malformed_usage_counters_fail_without_mutating_state() {
+        let root = root();
+        begin_graph_run(&begin(&root)).unwrap();
+        for usage in [
+            json!({"promptTokens": "many"}),
+            json!({"promptTokens": -1}),
+            json!({"promptTokens": 1.5}),
+            json!({"promptTokens": 5, "inputTokens": 7}),
+        ] {
+            let error = record_graph_command(&json!({
+                "stateRoot": root.to_string_lossy(),
+                "runId": "run:one",
+                "commandId": "command:malformed",
+                "stateId": "state:actor",
+                "kind": "actor",
+                "status": "succeeded",
+                "usage": usage
+            }))
+            .unwrap_err();
+            assert!(
+                error.code == "usage_ledger_counter_invalid"
+                    || error.code == "usage_ledger_counter_conflict",
+                "unexpected refusal: {}",
+                error.code
+            );
+        }
+        let report = workflow_report(&json!({"stateRoot": root.to_string_lossy()})).unwrap();
+        assert_eq!(report["runs"][0]["commands"].as_array().unwrap().len(), 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn accuracy_only_usage_is_not_evidence_and_explicit_unknown_stays_unknown() {
+        let root = root();
+        reserve_graph_command(&json!({
+            "stateRoot": root.to_string_lossy(),
+            "budgetId": "pool:accuracy",
+            "invocationId": "invocation:label",
+            "budget": {"limitTokens": 10, "usedTokens": 0},
+            "estimate": {"totalTokens": 4, "accuracy": "estimated"}
+        }))
+        .unwrap();
+        // An exact label on an empty usage object is not proven zero usage;
+        // the reservation stays held as unknown.
+        let held = settle_graph_command(&json!({
+            "stateRoot": root.to_string_lossy(),
+            "invocationId": "invocation:label",
+            "settlementStatus": "succeeded",
+            "usage": {"accuracy": "exact"}
+        }))
+        .unwrap();
+        assert_eq!(held["state"], "unknown");
+        let report = graph_admission_report(&json!({
+            "stateRoot": root.to_string_lossy()
+        }))
+        .unwrap();
+        assert_eq!(report["pools"][0]["reservedTokens"], 4);
+
+        reserve_graph_command(&json!({
+            "stateRoot": root.to_string_lossy(),
+            "budgetId": "pool:accuracy",
+            "invocationId": "invocation:unsure",
+            "budget": {"limitTokens": 10, "usedTokens": 0},
+            "estimate": {"totalTokens": 2, "accuracy": "estimated"}
+        }))
+        .unwrap();
+        let unsure = settle_graph_command(&json!({
+            "stateRoot": root.to_string_lossy(),
+            "invocationId": "invocation:unsure",
+            "settlementStatus": "succeeded",
+            "usage": {"promptTokens": 3, "totalTokens": 3, "accuracy": "unknown"}
+        }))
+        .unwrap();
+        assert_eq!(unsure["state"], "settled");
+        assert_eq!(unsure["usageAccuracy"], "unknown");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fresher_remaining_snapshot_narrows_availability() {
+        let root = root();
+        reserve_graph_command(&json!({
+            "stateRoot": root.to_string_lossy(),
+            "budgetId": "pool:fresh",
+            "invocationId": "invocation:first",
+            "budget": {"limitTokens": 10, "usedTokens": 0},
+            "estimate": {"totalTokens": 2, "accuracy": "estimated"}
+        }))
+        .unwrap();
+        // A later provider snapshot that only reports the remainder must not
+        // be shadowed by the older limit/used pair.
+        let denied = reserve_graph_command(&json!({
+            "stateRoot": root.to_string_lossy(),
+            "budgetId": "pool:fresh",
+            "invocationId": "invocation:second",
+            "budget": {"remainingTokens": 0},
+            "estimate": {"totalTokens": 1, "accuracy": "estimated"}
+        }))
+        .unwrap();
+        assert_eq!(denied["admitted"], false);
+        assert_eq!(denied["code"], "budget_exhausted");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pruned_runs_take_their_reservations_and_terminal_history_is_bounded() {
+        let root = root();
+        begin_graph_run(&begin(&root)).unwrap();
+        reserve_graph_command(&json!({
+            "stateRoot": root.to_string_lossy(),
+            "budgetId": "pool:prune",
+            "invocationId": "invocation:orphaned",
+            "runId": "run:one",
+            "budget": {"limitTokens": 1000000, "usedTokens": 0},
+            "estimate": {"totalTokens": 1, "accuracy": "estimated"}
+        }))
+        .unwrap();
+        // Close the original run, then push it out of the retained terminal
+        // window; its reservation — still holding budget — must be removed
+        // with it.
+        begin_graph_run(&json!({
+            "stateRoot": root.to_string_lossy(),
+            "runId": "run:one",
+            "revisionDigest": "revision:one",
+            "conversationId": "conversation:one",
+            "assistantMembershipId": "membership:assistant",
+            "status": "completed",
+        }))
+        .unwrap();
+        for index in 0..WORKFLOW_LEDGER_MAX_RUNS {
+            begin_graph_run(&json!({
+                "stateRoot": root.to_string_lossy(),
+                "runId": format!("run:{index}"),
+                "revisionDigest": format!("revision:{index}"),
+                "status": "completed",
+            }))
+            .unwrap();
+        }
+        let report = graph_admission_report(&json!({
+            "stateRoot": root.to_string_lossy()
+        }))
+        .unwrap();
+        assert!(
+            report["reservations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["invocationId"] != "invocation:orphaned"),
+            "orphaned reservation survived its run's prune"
+        );
         let _ = fs::remove_dir_all(root);
     }
 }
