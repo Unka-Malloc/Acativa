@@ -78,7 +78,7 @@ pub const GENERIC_PROJECTION_SCHEMA: &str = "acativa.strategy-state.v1";
 
 // Module paths stay resolvable as `crate::<module>` for all public machinery.
 pub use runtime::{adapter, driver, evolution, node, ports, service};
-pub use store::{control, routing};
+pub use store::{control, routing, usage_ledger};
 pub use workflow::{analysis, compile, diagnostic, dispatch, machine, syntax};
 
 pub use workflow::analysis::{

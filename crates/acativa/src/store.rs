@@ -29,6 +29,7 @@ pub mod routing;
 #[allow(clippy::module_inception)]
 mod store;
 mod subscriptions;
+pub mod usage_ledger;
 
 pub use admission::{
     MAX_UNFINISHED_WORKFLOW_WORK, UnfinishedWorkflowWork, WorkflowWorkBlocker, WorkflowWorkKind,
