@@ -598,6 +598,9 @@ pub fn record_graph_command(params: &Value) -> LedgerResult<Value> {
             "settlementStatus": settlement_status,
             "usage": params.get("usage").cloned().unwrap_or(Value::Null),
         });
+        if let Some(retention) = params.get("retention") {
+            settlement["retention"] = retention.clone();
+        }
         if settlement["stateRoot"].is_null() {
             settlement
                 .as_object_mut()
@@ -2033,12 +2036,16 @@ fn prune_terminal_runs(connection: &Connection, retention: &Retention) -> Ledger
     // A reservation may name a run that has not begun yet, so the doomed-run
     // set must be evaluated before any run row disappears: deleting by
     // "run_id absent" afterwards would mistake pre-start work for an orphan
-    // and break replay. Remove the reservations of exactly the runs being
-    // pruned, then the runs, inside this one transaction.
+    // and break replay. Remove the terminal reservations of exactly the runs
+    // being pruned, then the runs, inside this one transaction. A reserved or
+    // unknown reservation is an unresolved provider call whose usage may still
+    // arrive — it survives its run's prune so the hold and the reconciliation
+    // record persist.
     connection
         .execute(
             "DELETE FROM graph_usage_reservations
-             WHERE run_id IN (
+             WHERE state IN ('settled','released')
+               AND run_id IN (
                SELECT run_id FROM graph_runs
                WHERE status IN ('blocked','cancelled','failed','completed')
                  AND run_id NOT IN (
@@ -2895,21 +2902,45 @@ mod tests {
     }
 
     #[test]
-    fn pruned_runs_take_their_reservations_and_terminal_history_is_bounded() {
+    fn pruned_runs_take_terminal_reservations_but_unresolved_holds_survive() {
         let root = root();
         begin_graph_run(&begin(&root)).unwrap();
         reserve_graph_command(&json!({
             "stateRoot": root.to_string_lossy(),
             "budgetId": "pool:prune",
-            "invocationId": "invocation:orphaned",
+            "invocationId": "invocation:closed",
             "runId": "run:one",
             "budget": {"limitTokens": 1000000, "usedTokens": 0},
             "estimate": {"totalTokens": 1, "accuracy": "estimated"}
         }))
         .unwrap();
+        settle_graph_command(&json!({
+            "stateRoot": root.to_string_lossy(),
+            "invocationId": "invocation:closed",
+            "settlementStatus": "succeeded",
+            "usage": {"promptTokens": 1, "totalTokens": 1, "accuracy": "exact"}
+        }))
+        .unwrap();
+        // An unresolved reservation on the same run is still an in-flight
+        // provider call: its hold and reconciliation record must survive the
+        // run's prune and accept late usage.
+        reserve_graph_command(&json!({
+            "stateRoot": root.to_string_lossy(),
+            "budgetId": "pool:prune",
+            "invocationId": "invocation:unresolved",
+            "runId": "run:one",
+            "budget": {"limitTokens": 1000000, "usedTokens": 0},
+            "estimate": {"totalTokens": 3, "accuracy": "estimated"}
+        }))
+        .unwrap();
+        settle_graph_command(&json!({
+            "stateRoot": root.to_string_lossy(),
+            "invocationId": "invocation:unresolved",
+            "settlementStatus": "unknown"
+        }))
+        .unwrap();
         // Close the original run, then push it out of the retained terminal
-        // window; its reservation — still holding budget — must be removed
-        // with it.
+        // window.
         begin_graph_run(&json!({
             "stateRoot": root.to_string_lossy(),
             "runId": "run:one",
@@ -2932,14 +2963,28 @@ mod tests {
             "stateRoot": root.to_string_lossy()
         }))
         .unwrap();
+        let reservations = report["reservations"].as_array().unwrap();
         assert!(
-            report["reservations"]
-                .as_array()
-                .unwrap()
+            reservations
                 .iter()
-                .all(|row| row["invocationId"] != "invocation:orphaned"),
-            "orphaned reservation survived its run's prune"
+                .all(|row| row["invocationId"] != "invocation:closed"),
+            "terminal reservation survived its run's prune"
         );
+        assert!(
+            reservations
+                .iter()
+                .any(|row| row["invocationId"] == "invocation:unresolved"
+                    && row["state"] == "unknown"),
+            "unresolved reservation lost with its run's prune"
+        );
+        let late = settle_graph_command(&json!({
+            "stateRoot": root.to_string_lossy(),
+            "invocationId": "invocation:unresolved",
+            "settlementStatus": "succeeded",
+            "usage": {"promptTokens": 2, "totalTokens": 2, "accuracy": "exact"}
+        }))
+        .unwrap();
+        assert_eq!(late["state"], "settled");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2969,6 +3014,44 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(replay["state"], "released");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn record_graph_command_forwards_the_caller_retention_window() {
+        let root = root();
+        begin_graph_run(&begin(&root)).unwrap();
+        for index in 0..3 {
+            reserve_graph_command(&json!({
+                "stateRoot": root.to_string_lossy(),
+                "budgetId": "pool:retention",
+                "invocationId": format!("invocation:{index}"),
+                "commandId": format!("command:{index}"),
+                "budget": {"limitTokens": 1000000, "usedTokens": 0},
+                "estimate": {"totalTokens": 1, "accuracy": "estimated"}
+            }))
+            .unwrap();
+            // The record path settles the reservation internally; a caller
+            // that narrows the terminal window must see it honored there too.
+            record_graph_command(&json!({
+                "stateRoot": root.to_string_lossy(),
+                "runId": "run:one",
+                "commandId": format!("command:{index}"),
+                "stateId": "state:actor",
+                "kind": "actor",
+                "status": "succeeded",
+                "usage": {"promptTokens": 1, "totalTokens": 1, "accuracy": "exact"},
+                "retention": {"maxTerminalReservations": 1}
+            }))
+            .unwrap();
+        }
+        let report = graph_admission_report(&json!({
+            "stateRoot": root.to_string_lossy()
+        }))
+        .unwrap();
+        let reservations = report["reservations"].as_array().unwrap();
+        assert_eq!(reservations.len(), 1);
+        assert_eq!(reservations[0]["invocationId"], "invocation:2");
         let _ = fs::remove_dir_all(root);
     }
 }
