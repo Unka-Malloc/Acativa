@@ -29,10 +29,55 @@ pub const WORKFLOW_LEDGER_MAX_RUNS: usize = 256;
 /// Terminal reservation rows (`settled`/`released`) are kept for idempotent
 /// replay and reporting, then bounded — replaying against a row beyond this
 /// window reports `usage_ledger_reservation_not_found`, which is the retention
-/// contract, not data loss. Rows whose run has already been pruned are
-/// removed regardless of state: their work is gone and any budget they still
-/// hold is released.
+/// contract, not data loss. Reservations leave with their run when the run
+/// window prunes it; a held reservation whose work is gone releases its hold.
 pub const WORKFLOW_LEDGER_MAX_TERMINAL_RESERVATIONS: usize = 512;
+/// Retention windows a host may narrow or widen through `retention` on the
+/// ledger calls. The ceiling stops a deployment from turning bounded history
+/// into unbounded growth by configuration alone.
+pub const WORKFLOW_LEDGER_RETENTION_CEILING: u64 = 8192;
+
+/// Host-supplied retention bounds; defaults are the compiled constants.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Retention {
+    max_runs: u64,
+    max_terminal_reservations: u64,
+}
+
+impl Default for Retention {
+    fn default() -> Self {
+        Self {
+            max_runs: WORKFLOW_LEDGER_MAX_RUNS as u64,
+            max_terminal_reservations: WORKFLOW_LEDGER_MAX_TERMINAL_RESERVATIONS as u64,
+        }
+    }
+}
+
+fn parse_retention(params: &Value) -> LedgerResult<Retention> {
+    let mut retention = Retention::default();
+    let Some(object) = params.get("retention") else {
+        return Ok(retention);
+    };
+    let object = object
+        .as_object()
+        .ok_or_else(|| LedgerError::invalid("usage_ledger_retention_invalid"))?;
+    for (key, slot) in [
+        ("maxRuns", &mut retention.max_runs),
+        (
+            "maxTerminalReservations",
+            &mut retention.max_terminal_reservations,
+        ),
+    ] {
+        if let Some(value) = object.get(key) {
+            let parsed = value
+                .as_u64()
+                .filter(|v| (1..=WORKFLOW_LEDGER_RETENTION_CEILING).contains(v))
+                .ok_or_else(|| LedgerError::invalid("usage_ledger_retention_invalid"))?;
+            *slot = parsed;
+        }
+    }
+    Ok(retention)
+}
 
 /// A first-time WAL transition does not honor busy_timeout when two
 /// connections open a new ledger concurrently, so bound a retry to keep
@@ -418,7 +463,7 @@ pub fn begin_graph_run(params: &Value) -> LedgerResult<Value> {
             params![run_id, status, now],
         )
         .map_err(|_| LedgerError::storage())?;
-    prune_terminal_runs(&transaction)?;
+    prune_terminal_runs(&transaction, &parse_retention(params)?)?;
     transaction.commit().map_err(|_| LedgerError::storage())?;
     Ok(json!({
         "runId": run_id,
@@ -830,7 +875,7 @@ pub fn settle_graph_command(params: &Value) -> LedgerResult<Value> {
     let available = available_tokens(&pool, active);
     // Terminal transitions are the guaranteed maintenance path: reservations
     // without a later run start still hit the retention bound.
-    prune_terminal_runs(&transaction)?;
+    prune_terminal_runs(&transaction, &parse_retention(params)?)?;
     transaction.commit().map_err(|_| LedgerError::storage())?;
     Ok(settlement_value(
         &settled,
@@ -885,7 +930,7 @@ pub fn release_graph_command(params: &Value) -> LedgerResult<Value> {
         load_or_update_budget_pool(&transaction, &released.budget_id, BudgetSnapshot::default())?;
     let active = active_reservation_stats(&transaction, &released.budget_id)?;
     let available = available_tokens(&pool, active);
-    prune_terminal_runs(&transaction)?;
+    prune_terminal_runs(&transaction, &parse_retention(params)?)?;
     transaction.commit().map_err(|_| LedgerError::storage())?;
     Ok(json!({
         "ok": true,
@@ -1984,7 +2029,30 @@ fn command_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandRow> {
     })
 }
 
-fn prune_terminal_runs(connection: &Connection) -> LedgerResult<()> {
+fn prune_terminal_runs(connection: &Connection, retention: &Retention) -> LedgerResult<()> {
+    // A reservation may name a run that has not begun yet, so the doomed-run
+    // set must be evaluated before any run row disappears: deleting by
+    // "run_id absent" afterwards would mistake pre-start work for an orphan
+    // and break replay. Remove the reservations of exactly the runs being
+    // pruned, then the runs, inside this one transaction.
+    connection
+        .execute(
+            "DELETE FROM graph_usage_reservations
+             WHERE run_id IN (
+               SELECT run_id FROM graph_runs
+               WHERE status IN ('blocked','cancelled','failed','completed')
+                 AND run_id NOT IN (
+                   SELECT run_id FROM graph_runs
+                   WHERE status IN ('blocked','cancelled','failed','completed')
+                   ORDER BY updated_at_ms DESC,run_id DESC LIMIT ?1
+                 )
+             )",
+            params![sqlite_u64(
+                retention.max_runs,
+                "usage_ledger_retention_invalid"
+            )?],
+        )
+        .map_err(|_| LedgerError::storage())?;
     connection
         .execute(
             "DELETE FROM graph_runs
@@ -1994,21 +2062,15 @@ fn prune_terminal_runs(connection: &Connection) -> LedgerResult<()> {
                  WHERE status IN ('blocked','cancelled','failed','completed')
                  ORDER BY updated_at_ms DESC,run_id DESC LIMIT ?1
                )",
-            params![WORKFLOW_LEDGER_MAX_RUNS],
+            params![sqlite_u64(
+                retention.max_runs,
+                "usage_ledger_retention_invalid"
+            )?],
         )
         .map_err(|_| LedgerError::storage())?;
-    // Reservations carry no FK to graph_runs, so prune them here: rows bound
-    // to a run that no longer exists are removed (a held reservation whose
-    // run is gone releases its stale hold), and terminal history is bounded
-    // to the newest window.
-    connection
-        .execute(
-            "DELETE FROM graph_usage_reservations
-             WHERE run_id IS NOT NULL
-               AND run_id NOT IN (SELECT run_id FROM graph_runs)",
-            [],
-        )
-        .map_err(|_| LedgerError::storage())?;
+    // Terminal rows are kept for idempotent replay and reporting, bounded to
+    // the newest window — replaying beyond it reports not-found, which is the
+    // retention contract, not data loss.
     connection
         .execute(
             "DELETE FROM graph_usage_reservations
@@ -2018,7 +2080,10 @@ fn prune_terminal_runs(connection: &Connection) -> LedgerResult<()> {
                  WHERE state IN ('settled','released')
                  ORDER BY updated_at_ms DESC,invocation_id DESC LIMIT ?1
                )",
-            params![WORKFLOW_LEDGER_MAX_TERMINAL_RESERVATIONS],
+            params![sqlite_u64(
+                retention.max_terminal_reservations,
+                "usage_ledger_retention_invalid"
+            )?],
         )
         .map_err(|_| LedgerError::storage())?;
     Ok(())
@@ -2875,6 +2940,35 @@ mod tests {
                 .all(|row| row["invocationId"] != "invocation:orphaned"),
             "orphaned reservation survived its run's prune"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_reservation_named_before_its_run_begins_keeps_replay() {
+        let root = root();
+        // Admissions may carry a runId before the run row exists; releasing
+        // one must not mistake it for an orphan and delete its history.
+        reserve_graph_command(&json!({
+            "stateRoot": root.to_string_lossy(),
+            "budgetId": "pool:prestart",
+            "invocationId": "invocation:prestart",
+            "runId": "run:later",
+            "budget": {"limitTokens": 10, "usedTokens": 0},
+            "estimate": {"totalTokens": 4, "accuracy": "estimated"}
+        }))
+        .unwrap();
+        let released = release_graph_command(&json!({
+            "stateRoot": root.to_string_lossy(),
+            "invocationId": "invocation:prestart"
+        }))
+        .unwrap();
+        assert_eq!(released["state"], "released");
+        let replay = release_graph_command(&json!({
+            "stateRoot": root.to_string_lossy(),
+            "invocationId": "invocation:prestart"
+        }))
+        .unwrap();
+        assert_eq!(replay["state"], "released");
         let _ = fs::remove_dir_all(root);
     }
 }
